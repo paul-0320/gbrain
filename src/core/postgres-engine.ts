@@ -588,6 +588,8 @@ export class PostgresEngine implements BrainEngine {
       pages_generation_exists?: boolean;
       pages_embedding_signature_exists?: boolean;
       pages_links_extracted_at_exists?: boolean;
+      timeline_entries_exists?: boolean;
+      timeline_event_page_id_exists?: boolean;
     };
     const needsContextualRetrievalColumns = (probe.pages_exists
         && (!probeCr.pages_cr_mode_exists || !probeCr.pages_corpus_generation_exists))
@@ -607,19 +609,9 @@ export class PostgresEngine implements BrainEngine {
     // SCHEMA_SQL replay creates the index. v112 runs later via runMigrations
     // and is idempotent.
     const needsPagesLinksExtractedAt = probe.pages_exists && !probeCr.pages_links_extracted_at_exists;
-    // v0.42.x (v121, Life Chronicle #2390): idx_timeline_event_page +
-    // idx_timeline_event_dedup in SCHEMA_SQL reference event_page_id.
-    // `CREATE TABLE IF NOT EXISTS timeline_entries` is a no-op on pre-v121
-    // brains (won't add the column), so the blob's CREATE INDEX crashes with
-    // `column "event_page_id" does not exist` before v121 ever runs. Bootstrap
-    // adds the bare column; the FK + indexes land via v121 / the blob, both
-    // idempotent.
-    const probeTimeline = probe as {
-      timeline_entries_exists?: boolean;
-      timeline_event_page_id_exists?: boolean;
-    };
-    const needsTimelineEventPageId = !!probeTimeline.timeline_entries_exists
-      && !probeTimeline.timeline_event_page_id_exists;
+    // v121: schema-blob indexes reference event_page_id before migrations run.
+    const needsTimelineEventPageId = probeCr.timeline_entries_exists === true
+      && !probeCr.timeline_event_page_id_exists;
 
     if (!needsPagesBootstrap && !needsLinksBootstrap && !needsChunksBootstrap
         && !needsPagesDeletedAt && !needsMcpLogBootstrap && !needsSubagentProviderId
@@ -880,11 +872,8 @@ export class PostgresEngine implements BrainEngine {
     }
 
     if (needsTimelineEventPageId) {
-      // v121 (timeline_entries_event_page_id, Life Chronicle #2390): the
-      // event→timeline projection pointer. SCHEMA_SQL's partial indexes
-      // idx_timeline_event_page + idx_timeline_event_dedup reference it, so
-      // bootstrap adds the bare column before the blob's CREATE INDEX runs.
-      // The FK + indexes land via the blob and v121, both idempotent.
+      // Add only the forward-referenced column. Migration v121 remains the
+      // source of truth for the FK and indexes and runs idempotently afterward.
       await conn.unsafe(`
         ALTER TABLE timeline_entries ADD COLUMN IF NOT EXISTS event_page_id INTEGER;
       `);
@@ -4638,6 +4627,11 @@ export class PostgresEngine implements BrainEngine {
   async searchTakes(query: string, opts: SearchOpts & { takesHoldersAllowList?: string[] } = {}): Promise<TakeHit[]> {
     const sql = this.sql;
     const limit = clampSearchLimit(opts.limit, 30, 100);
+    const sourceFilter = opts.sourceIds && opts.sourceIds.length > 0
+      ? sql`AND p.source_id = ANY(${opts.sourceIds}::text[])`
+      : opts.sourceId
+        ? sql`AND p.source_id = ${opts.sourceId}`
+        : sql``;
     const rows = await sql`
       SELECT t.id AS take_id, t.page_id, p.slug AS page_slug, t.row_num,
              t.claim, t.kind, t.holder, t.weight,
@@ -4650,6 +4644,7 @@ export class PostgresEngine implements BrainEngine {
           ${opts.takesHoldersAllowList ?? null}::text[] IS NULL
           OR t.holder = ANY(${opts.takesHoldersAllowList ?? null}::text[])
         )
+        ${sourceFilter}
       ORDER BY score DESC, t.weight DESC
       LIMIT ${limit}
     `;
@@ -4663,6 +4658,11 @@ export class PostgresEngine implements BrainEngine {
     const sql = this.sql;
     const limit = clampSearchLimit(opts.limit, 30, 100);
     const vec = `[${Array.from(embedding).join(',')}]`;
+    const sourceFilter = opts.sourceIds && opts.sourceIds.length > 0
+      ? sql`AND p.source_id = ANY(${opts.sourceIds}::text[])`
+      : opts.sourceId
+        ? sql`AND p.source_id = ${opts.sourceId}`
+        : sql``;
     const rows = await sql`
       SELECT t.id AS take_id, t.page_id, p.slug AS page_slug, t.row_num,
              t.claim, t.kind, t.holder, t.weight,
@@ -4675,6 +4675,7 @@ export class PostgresEngine implements BrainEngine {
           ${opts.takesHoldersAllowList ?? null}::text[] IS NULL
           OR t.holder = ANY(${opts.takesHoldersAllowList ?? null}::text[])
         )
+        ${sourceFilter}
       ORDER BY t.embedding <=> ${vec}::vector
       LIMIT ${limit}
     `;

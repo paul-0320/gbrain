@@ -643,15 +643,8 @@ export class PGLiteEngine implements BrainEngine {
     // it; pre-v112 brains crash without the column, so bootstrap adds it before
     // the CREATE INDEX runs. v112 runs later via runMigrations and is idempotent.
     const needsPagesLinksExtractedAt = probe.pages_exists && !probe.pages_links_extracted_at_exists;
-    // v0.42.x (v121, Life Chronicle #2390): idx_timeline_event_page +
-    // idx_timeline_event_dedup in PGLITE_SCHEMA_SQL reference event_page_id.
-    // `CREATE TABLE IF NOT EXISTS timeline_entries` is a no-op on pre-v121
-    // brains (won't add the column), so the blob's CREATE INDEX crashes with
-    // `column "event_page_id" does not exist` before v121 ever runs. Bootstrap
-    // adds the bare column; the FK + indexes land via v121 / the blob, both
-    // idempotent.
-    const needsTimelineEventPageId = probe.timeline_entries_exists
-      && !probe.timeline_event_page_id_exists;
+    // v121: schema-blob indexes reference event_page_id before migrations run.
+    const needsTimelineEventPageId = probe.timeline_entries_exists && !probe.timeline_event_page_id_exists;
 
     // Fresh installs (no tables yet) and modern brains both no-op.
     if (!needsPagesBootstrap && !needsLinksBootstrap && !needsChunksBootstrap
@@ -913,11 +906,8 @@ export class PGLiteEngine implements BrainEngine {
     }
 
     if (needsTimelineEventPageId) {
-      // v121 (timeline_entries_event_page_id, Life Chronicle #2390): the
-      // event→timeline projection pointer. PGLITE_SCHEMA_SQL's partial indexes
-      // idx_timeline_event_page + idx_timeline_event_dedup reference it, so
-      // bootstrap adds the bare column before the blob's CREATE INDEX runs.
-      // The FK + indexes land via the blob and v121, both idempotent.
+      // Add only the forward-referenced column. Migration v121 remains the
+      // source of truth for the FK and indexes and runs idempotently afterward.
       await this.db.exec(`
         ALTER TABLE timeline_entries ADD COLUMN IF NOT EXISTS event_page_id INTEGER;
       `);
@@ -4622,7 +4612,7 @@ export class PGLiteEngine implements BrainEngine {
 
   async searchTakes(
     query: string,
-    opts: { limit?: number; takesHoldersAllowList?: string[] } = {},
+    opts: SearchOpts & { takesHoldersAllowList?: string[] } = {},
   ): Promise<TakeHit[]> {
     const limit = clampSearchLimit(opts.limit, 30, 100);
     const { rows } = await this.db.query(
@@ -4634,16 +4624,24 @@ export class PGLiteEngine implements BrainEngine {
        WHERE t.active
          AND t.claim % $1
          AND ($2::text[] IS NULL OR t.holder = ANY($2::text[]))
+         AND ($4::text[] IS NULL OR p.source_id = ANY($4::text[]))
+         AND ($5::text IS NULL OR p.source_id = $5::text)
        ORDER BY score DESC, t.weight DESC
        LIMIT $3`,
-      [query, opts.takesHoldersAllowList ?? null, limit]
+      [
+        query,
+        opts.takesHoldersAllowList ?? null,
+        limit,
+        opts.sourceIds && opts.sourceIds.length > 0 ? opts.sourceIds : null,
+        opts.sourceIds && opts.sourceIds.length > 0 ? null : (opts.sourceId ?? null),
+      ]
     );
     return rows as unknown as TakeHit[];
   }
 
   async searchTakesVector(
     embedding: Float32Array,
-    opts: { limit?: number; takesHoldersAllowList?: string[] } = {},
+    opts: SearchOpts & { takesHoldersAllowList?: string[] } = {},
   ): Promise<TakeHit[]> {
     const limit = clampSearchLimit(opts.limit, 30, 100);
     const vec = `[${Array.from(embedding).join(',')}]`;
@@ -4656,9 +4654,17 @@ export class PGLiteEngine implements BrainEngine {
        WHERE t.active
          AND t.embedding IS NOT NULL
          AND ($2::text[] IS NULL OR t.holder = ANY($2::text[]))
+         AND ($4::text[] IS NULL OR p.source_id = ANY($4::text[]))
+         AND ($5::text IS NULL OR p.source_id = $5::text)
        ORDER BY t.embedding <=> $1::vector
        LIMIT $3`,
-      [vec, opts.takesHoldersAllowList ?? null, limit]
+      [
+        vec,
+        opts.takesHoldersAllowList ?? null,
+        limit,
+        opts.sourceIds && opts.sourceIds.length > 0 ? opts.sourceIds : null,
+        opts.sourceIds && opts.sourceIds.length > 0 ? null : (opts.sourceId ?? null),
+      ]
     );
     return rows as unknown as TakeHit[];
   }
