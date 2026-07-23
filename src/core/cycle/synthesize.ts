@@ -28,6 +28,7 @@
 
 import type Anthropic from '@anthropic-ai/sdk';
 import { readFileSync, existsSync, writeFileSync, mkdirSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import { chat as gatewayChat, validateModelId, type ChatResult } from '../ai/gateway.ts';
 import { AIConfigError } from '../ai/errors.ts';
 import { normalizeModelId } from '../model-id.ts';
@@ -37,16 +38,18 @@ import type { BrainEngine } from '../engine.ts';
 import type { PhaseResult, PhaseError } from '../cycle.ts';
 import { MinionQueue } from '../minions/queue.ts';
 import { waitForCompletion, TimeoutError } from '../minions/wait-for-completion.ts';
-import type { MinionJobInput, SubagentHandlerData } from '../minions/types.ts';
+import { makeSubagentHandler } from '../minions/handlers/subagent.ts';
+import type { MinionJobInput, MinionJobContext, MinionHandler, SubagentHandlerData } from '../minions/types.ts';
 import { discoverTranscripts, type DiscoveredTranscript } from './transcript-discovery.ts';
 import { serializeMarkdown, serializePageToMarkdown } from '../markdown.ts';
 import type { Page, PageType } from '../types.ts';
 import { validateSourceId } from '../utils.ts';
 import { safeSplitIndex } from '../text-safe.ts';
+import { PAGE_SLUG_SEG } from '../cjk.ts';
 
-// Slug regex from validatePageSlug — kept in sync.
+// Slug grammar from validatePageSlug — shared via PAGE_SLUG_SEG (#738).
 // Used for the orchestrator-written summary index slug.
-const SUMMARY_SLUG_RE = /^[a-z0-9][a-z0-9\-]*(\/[a-z0-9][a-z0-9\-]*)*$/;
+const SUMMARY_SLUG_RE = new RegExp(`^${PAGE_SLUG_SEG}(\\/${PAGE_SLUG_SEG})*$`);
 
 // ── Model context budget (D1, D5, D7, D9) ─────────────────────────────
 
@@ -261,6 +264,121 @@ export interface SynthesizePhaseOpts {
   once?: boolean;
 }
 
+const INLINE_PGLITE_LOCK_MS = 30_000;
+
+/**
+ * PGLite cannot be served by a separate Minions worker process: the embedded
+ * data-dir holds an exclusive file lock, so subagent children enqueued by the
+ * synth parent would sit in 'waiting' until waitForCompletion times out.
+ * Drive the same claim → run → complete/fail loop a worker would perform,
+ * inline, against this phase's private child queue.
+ *
+ * `yieldDuringPhase` is ticked on a 60s interval while a child runs so the
+ * 5-min cycle lock TTL keeps refreshing during long (up to 30-min) children.
+ */
+async function runPgliteSubagentsInline(
+  engine: BrainEngine,
+  queue: MinionQueue,
+  queueName: string,
+  yieldDuringPhase?: () => Promise<void>,
+  handler: MinionHandler = makeSubagentHandler({ engine }),
+): Promise<void> {
+  if (engine.kind !== 'pglite') return;
+
+  while (true) {
+    // Housekeeping a worker would normally perform, so child rows can reach
+    // terminal states (delayed retries promoted, timeouts dead-lettered)
+    // before the synth parent enters waitForCompletion polling.
+    await queue.promoteDelayed();
+    await queue.handleStalled();
+    await queue.handleTimeouts();
+    await queue.handleWallClockTimeouts(INLINE_PGLITE_LOCK_MS);
+
+    const lockToken = randomUUID();
+    const job = await queue.claim(lockToken, INLINE_PGLITE_LOCK_MS, queueName, ['subagent']);
+    if (!job) return;
+
+    const abort = new AbortController();
+    const shutdown = new AbortController();
+    const context: MinionJobContext = {
+      id: job.id,
+      name: job.name,
+      data: job.data,
+      attempts_made: job.attempts_made,
+      signal: abort.signal,
+      deadlineAtMs: job.timeout_at != null ? job.timeout_at.getTime() : null,
+      shutdownSignal: shutdown.signal,
+      updateProgress: async (progress: unknown) => {
+        await queue.updateProgress(job.id, lockToken, progress);
+      },
+      updateTokens: async (tokens) => {
+        await queue.updateTokens(job.id, lockToken, tokens);
+      },
+      log: async (message) => {
+        const value = typeof message === 'string' ? message : JSON.stringify(message);
+        await engine.executeRaw(
+          `UPDATE minion_jobs SET stacktrace = COALESCE(stacktrace, '[]'::jsonb) || to_jsonb($1::text),
+            updated_at = now()
+           WHERE id = $2 AND status = 'active' AND lock_token = $3`,
+          [value, job.id, lockToken],
+        );
+      },
+      isActive: async () => {
+        const rows = await engine.executeRaw<{ id: number }>(
+          `SELECT id FROM minion_jobs WHERE id = $1 AND status = 'active' AND lock_token = $2`,
+          [job.id, lockToken],
+        );
+        return rows.length > 0;
+      },
+      readInbox: async () => queue.readInbox(job.id, lockToken),
+    };
+
+    // Per-job deadline enforcement (worker.ts parity). While the drain loop
+    // awaits the handler, the handleTimeouts sweep above can't run, so nothing
+    // else can stop a child that blows past timeout_ms — the handler only
+    // stops when ctx.signal fires. Derive the delay from the claim-time
+    // timeout_at stamp so timer, DB sweeper, and deadlineAtMs agree.
+    let timeoutTimer: ReturnType<typeof setTimeout> | null = null;
+    if (job.timeout_ms != null) {
+      const delayMs = job.timeout_at != null
+        ? Math.max(0, job.timeout_at.getTime() - Date.now())
+        : job.timeout_ms;
+      timeoutTimer = setTimeout(() => {
+        if (!abort.signal.aborted) abort.abort(new Error('timeout'));
+      }, delayMs);
+    }
+
+    // Cycle-lock keepalive while the child runs (best-effort, never throws).
+    const keepalive = yieldDuringPhase
+      ? setInterval(() => { yieldDuringPhase().catch(() => { /* best-effort */ }); }, 60_000)
+      : null;
+    try {
+      const result = await handler(context);
+      await queue.completeJob(
+        job.id,
+        lockToken,
+        result != null ? (typeof result === 'object' ? result as Record<string, unknown> : { value: result }) : undefined,
+      );
+    } catch (e) {
+      // Timeout is terminal (handleTimeouts parity: stall → retry,
+      // timeout → dead), never a delayed retry.
+      const timedOut = abort.signal.aborted;
+      const errorText = timedOut ? 'timeout exceeded' : (e instanceof Error ? e.message : String(e));
+      const attemptsExhausted = job.attempts_made + 1 >= job.max_attempts;
+      await queue.failJob(
+        job.id,
+        lockToken,
+        errorText,
+        timedOut || attemptsExhausted ? 'dead' : 'delayed',
+        0,
+      );
+    } finally {
+      if (timeoutTimer) clearTimeout(timeoutTimer);
+      if (keepalive) clearInterval(keepalive);
+    }
+  }
+}
+
 export async function runPhaseSynthesize(
   engine: BrainEngine,
   opts: SynthesizePhaseOpts,
@@ -427,6 +545,12 @@ export async function runPhaseSynthesize(
     }
 
     const queue = new MinionQueue(engine);
+    // PGLite children drain inline (no separate worker can open the embedded
+    // data-dir), so give them a private per-run queue: the inline drain must
+    // never claim unrelated 'default'-queue jobs a Postgres worker owns.
+    const childQueueName = engine.kind === 'pglite'
+      ? `dream-inline-${Date.now()}-${randomUUID().slice(0, 8)}`
+      : 'default';
     const childIds: number[] = [];
     /** Map child job_id → chunk metadata for D6 orchestrator-side slug rewrite. */
     const chunkInfo = new Map<number, { idx: number; hash6: string }>();
@@ -505,6 +629,7 @@ export async function runPhaseSynthesize(
           on_child_fail: 'continue',
           idempotency_key,
           timeout_ms: config.subagentTimeoutMs,
+          queue: childQueueName,
         };
         const child = await queue.add(
           'subagent',
@@ -518,6 +643,12 @@ export async function runPhaseSynthesize(
         }
       }
     }
+
+    // PGLite cannot run a separate Minions worker because the embedded DB
+    // holds an exclusive file lock. Drain this phase's private child queue
+    // inline so the parent observes terminal child states instead of polling
+    // waiters until subagentWaitTimeoutMs expires. No-op on Postgres.
+    await runPgliteSubagentsInline(engine, queue, childQueueName, opts.yieldDuringPhase);
 
     // Wait for every child to reach a terminal state. Tick yieldDuringPhase
     // every 5 min so the cycle lock TTL refreshes.
@@ -1381,4 +1512,5 @@ export const __testing = {
   buildSynthesisPrompt,
   stampDreamProvenance,
   reverseWriteRefs,
+  runPgliteSubagentsInline,
 };

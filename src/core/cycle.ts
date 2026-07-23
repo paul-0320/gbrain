@@ -855,8 +855,16 @@ interface SyncPhaseResult extends PhaseResult {
  * Resolve the source id for a brain directory by looking up the sources
  * table. Returns undefined when no registered source matches (falls back
  * to pre-v0.18 global config.sync.* keys).
+ *
+ * Exported for dream.ts (#1869): a `gbrain dream --dir <path>` run whose
+ * path matches a registered source's local_path is a per-source cycle in
+ * everything but name, so dream derives the source id up front and passes
+ * it as opts.sourceId — landing the freshness stamp without changing
+ * runCycle's stamp/lock semantics for legacy global callers (the
+ * autopilot-global-maintenance handler runs GLOBAL_PHASES with a brainDir
+ * and MUST NOT stamp per-source freshness; see rejected PR #2549).
  */
-async function resolveSourceForDir(
+export async function resolveSourceForDir(
   engine: BrainEngine,
   brainDir: string | null,
 ): Promise<string | undefined> {
@@ -935,13 +943,21 @@ async function runPhaseSync(
                                            // sync's inline extract still runs to preserve prior behavior.
     });
     const syncedCount = result.added + result.modified;
+    // #3068: a pull_failed partial means the internal git pull failed and the
+    // run imported nothing — the source may be silently behind its remote and
+    // will not self-heal. Surface it as 'warn' (not 'ok') so a scheduled cycle
+    // doesn't report a clean run over a wedged source. Timeout-class partials
+    // keep the pre-existing 'ok' mapping (they converge on retry by design).
+    const pullFailedPartial = result.status === 'partial' && result.reason === 'pull_failed';
     return {
       phase: 'sync',
-      status: result.status === 'blocked_by_failures' ? 'warn' : 'ok',
+      status: result.status === 'blocked_by_failures' || pullFailedPartial ? 'warn' : 'ok',
       duration_ms: 0,
       summary: dryRun
         ? `${syncedCount} page(s) would sync, ${result.deleted} would delete`
-        : `+${result.added} added, ~${result.modified} modified, -${result.deleted} deleted`,
+        : pullFailedPartial
+          ? `git pull failed, nothing imported — source may be behind its remote (sync anchor unchanged)`
+          : `+${result.added} added, ~${result.modified} modified, -${result.deleted} deleted`,
       details: {
         added: result.added,
         modified: result.modified,
@@ -950,6 +966,7 @@ async function runPhaseSync(
         chunksCreated: result.chunksCreated,
         failedFiles: result.failedFiles ?? 0,
         syncStatus: result.status,
+        ...(result.reason ? { syncReason: result.reason } : {}),
         dryRun,
       },
       pagesAffected: result.pagesAffected,
@@ -1214,7 +1231,9 @@ async function runPhaseEmbed(engine: BrainEngine, dryRun: boolean, signal?: Abor
     // 10-15 min one) bails within a batch instead of running to completion
     // after the job was killed — which left gbrain_cycle_locks held and
     // wedged every subsequent autopilot cycle.
-    const result = await runEmbedCore(engine, { stale: true, dryRun, signal });
+    // #394: quiet — the cycle reports embed counts via its own PhaseResult;
+    // raw `[dry-run] Would embed ...` stdout lines would corrupt `dream --json`.
+    const result = await runEmbedCore(engine, { stale: true, dryRun, signal, quiet: true });
     const embeddedCount = dryRun ? result.would_embed : result.embedded;
     return {
       phase: 'embed',

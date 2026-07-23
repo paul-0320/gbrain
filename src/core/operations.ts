@@ -25,7 +25,7 @@ import { bumpLastRetrievedAt } from './last-retrieved.ts';
 import { isSearchMode } from './search/mode.ts';
 import { stampEvidence } from './search/evidence.ts';
 import type { SearchResult } from './types.ts';
-import { CJK_SLUG_CHARS } from './cjk.ts';
+import { CJK_SLUG_CHARS, PAGE_SLUG_SEG } from './cjk.ts';
 import * as db from './db.ts';
 import { VERSION } from '../version.ts';
 import {
@@ -162,7 +162,6 @@ export function validatePageSlug(slug: string): void {
   }
   // v0.32.7: CJK ranges (Han / Hiragana / Katakana / Hangul Syllables) allowed
   // in segments. ASCII shape rules (lead char, hyphen continuation) preserved.
-  const PAGE_SLUG_SEG = `[a-z0-9${CJK_SLUG_CHARS}][a-z0-9${CJK_SLUG_CHARS}\\-]*`;
   if (!new RegExp(`^${PAGE_SLUG_SEG}(\\/${PAGE_SLUG_SEG})*$`, 'i').test(slug)) {
     throw new OperationError('invalid_params', `Invalid page_slug: ${slug} (allowed: alphanumeric, CJK, hyphens, forward-slash separated segments)`);
   }
@@ -333,6 +332,15 @@ export interface OperationContext {
    */
   remote: boolean;
   /**
+   * Transport marker for auth-less remote surfaces (#1061). The stdio MCP
+   * dispatch sets 'stdio' — it is deliberately `remote: true` (agent-facing,
+   * untrusted) but has no per-token auth (local pipe), so identity ops like
+   * whoami need a way to distinguish "known auth-less transport" from "a
+   * transport bug forgot to thread ctx.auth". Trust decisions MUST NOT key
+   * off this field — only `ctx.remote === false` grants trust.
+   */
+  transport?: 'stdio';
+  /**
    * Subagent runtime context (v0.16+). Set by the subagent tool dispatcher when
    * dispatching an op as a tool call from an LLM loop. Used to enforce per-op
    * agent policy (e.g. put_page namespace rule).
@@ -424,6 +432,23 @@ export interface OperationContext {
    * satisfied even on single-source brains.
    */
   sourceId: string;
+  /**
+   * #2561 — federated read scope for UNQUALIFIED local CLI reads.
+   *
+   * Set ONLY by the local CLI's context builder (src/cli.ts makeContext), and
+   * only when the source resolved via a non-explicit tier (local_path /
+   * brain_default / sole_non_default / seed_default — NOT --source, NOT
+   * GBRAIN_SOURCE, NOT a .gbrain-source dotfile). Contains the resolved
+   * source first, then every other `config.federated = true` source, so an
+   * unqualified `gbrain search "X"` spans federated sources as
+   * docs/guides/multi-source-brains.md promises.
+   *
+   * Consumed exclusively by `federatedSearchScope` and ONLY when
+   * `ctx.remote === false` — a remote caller's scope stays governed by
+   * `ctx.auth.allowedSources` / scalar `ctx.sourceId` (source-isolation
+   * invariant, fail-closed).
+   */
+  localFederatedSourceIds?: string[];
 }
 
 /**
@@ -537,6 +562,45 @@ export function resolveRequestedScope(
     return { sourceId: sourceIdParam };
   }
   return sourceScopeOpts(ctx);
+}
+
+/**
+ * #2561 — source scope for the search-shaped read ops (`search`, `query`).
+ *
+ * Delegates to `resolveRequestedScope` (the single trust+grant resolver), then
+ * widens an UNQUALIFIED trusted-local scalar scope to the CLI-computed
+ * federated set (`ctx.localFederatedSourceIds`, resolved source first). This is
+ * what makes `sources add --federated` mean something for local search: a
+ * federated source participates in unqualified `gbrain search "X"` results.
+ *
+ * The expansion NEVER applies when:
+ *   - the caller is not strictly trusted-local (`ctx.remote !== false`) —
+ *     remote scope stays grant-governed (fail-closed source isolation);
+ *   - a per-call `source_id` was passed (explicit wins, including `__all__`);
+ *   - the resolver already produced a federated array (OAuth grant);
+ *   - the CLI resolved the source from an explicit signal (--source / env /
+ *     dotfile) — makeContext leaves `localFederatedSourceIds` unset then.
+ *
+ * Deliberately NOT inside `sourceScopeOpts`: code-intel ops collapse a
+ * multi-element scope to an error (`resolveCodeIntelScope`), and non-search
+ * reads (get_page, get_links, …) keep their long-standing scalar behavior.
+ */
+export function federatedSearchScope(
+  ctx: OperationContext,
+  sourceIdParam?: string,
+): { sourceId?: string; sourceIds?: string[] } {
+  const scope = resolveRequestedScope(ctx, sourceIdParam);
+  if (
+    ctx.remote === false &&
+    sourceIdParam === undefined &&
+    scope.sourceId !== undefined &&
+    scope.sourceIds === undefined &&
+    ctx.localFederatedSourceIds !== undefined &&
+    ctx.localFederatedSourceIds.length > 1
+  ) {
+    return { sourceIds: ctx.localFederatedSourceIds };
+  }
+  return scope;
 }
 
 /**
@@ -773,6 +837,7 @@ const put_page: Operation = {
   params: {
     slug: { type: 'string', required: true, description: 'Page slug' },
     content: { type: 'string', required: true, description: 'Full markdown content with YAML frontmatter' },
+    allow_empty: { type: 'boolean', required: false, description: 'Allow overwriting an existing non-empty page with empty/whitespace-only content (default: false). Without it, put_page rejects the empty overwrite — the empty-stdin failure class.' },
     // v0.39.3.0 provenance write-through (WARN-8 + A1 + CV6). Optional fields
     // for trusted local callers (capture CLI, autopilot, dream cycle). Remote
     // MCP callers (ctx.remote !== false) have their values OVERRIDDEN with
@@ -822,6 +887,30 @@ const put_page: Operation = {
     enforceSubagentSlugFence(ctx, slug, 'put_page');
 
     if (ctx.dryRun) return { dry_run: true, action: 'put_page', slug: p.slug };
+
+    // Empty-overwrite guard: empty/whitespace-only content over an existing
+    // non-empty page is almost always an input-plumbing failure (e.g. a
+    // caller that meant file input — put has no --file flag — so the missing
+    // --content fell back to reading an empty non-interactive stdin), not an
+    // intentional write. Refuse loudly unless the caller opts in with
+    // allow_empty. The read is scoped to the exact (source_id, slug) row the
+    // write below targets (engine.putPage defaults to 'default' when
+    // sourceId is unset). New-slug creates and soft-deleted-page overwrites
+    // stay allowed — nothing recoverable is lost there.
+    if ((p.content as string).trim() === '' && p.allow_empty !== true) {
+      const existing = await ctx.engine.getPage(slug, { sourceId: ctx.sourceId ?? 'default' });
+      const existingBody = existing
+        ? `${existing.compiled_truth ?? ''}\n${existing.timeline ?? ''}`.trim()
+        : '';
+      if (existingBody !== '') {
+        throw new OperationError(
+          'invalid_params',
+          `Refusing to overwrite existing non-empty page '${slug}' with empty content.`,
+          'For file input use `gbrain capture --file PATH --slug SLUG` (put has no --file flag). To intentionally blank the page, pass allow_empty: true (CLI: --allow-empty).',
+        );
+      }
+    }
+
     // Skip embedding when the AI gateway has no embedding provider configured.
     // Checks all auth env vars for the resolved provider, not just OPENAI_API_KEY,
     // so Gemini / Ollama / Voyage brains don't silently drop embeddings (Codex C2).
@@ -1426,6 +1515,7 @@ const list_pages: Operation = {
     });
     return pages.map(pg => ({
       slug: pg.slug,
+      source_id: pg.source_id,
       type: pg.type,
       title: pg.title,
       updated_at: pg.updated_at,
@@ -1452,7 +1542,8 @@ const search: Operation = {
     const queryText = p.query as string;
     const limit = (p.limit as number) || 20;
     const offset = (p.offset as number) || 0;
-    const scope = sourceScopeOpts(ctx);
+    // #2561: unqualified trusted-local search spans federated sources.
+    const scope = federatedSearchScope(ctx);
 
     // T4/D5 — per-call mode honored ONLY for trusted/local callers so a remote
     // OAuth client can't escalate to the costly tokenmax bundle. Local + unknown
@@ -1614,7 +1705,9 @@ const query: Operation = {
     // is spread into BOTH the image-similarity searchVector path and the text
     // hybridSearch path below, so both honor the same grant.
     const sourceIdParam = typeof p.source_id === 'string' ? p.source_id : undefined;
-    const querySourceScope = resolveRequestedScope(ctx, sourceIdParam);
+    // #2561: unqualified trusted-local query spans federated sources (per-call
+    // source_id / remote grants still resolve through resolveRequestedScope).
+    const querySourceScope = federatedSearchScope(ctx, sourceIdParam);
 
     // v0.27.1: image-similarity branch. Bypasses hybridSearch (which is
     // text-only); embeds the image via embedMultimodal and runs a direct
@@ -2679,6 +2772,11 @@ const log_ingest: Operation = {
   handler: async (ctx, p) => {
     if (ctx.dryRun) return { dry_run: true, action: 'log_ingest' };
     await ctx.engine.logIngest({
+      // Thread ctx.sourceId (same pattern as get_chunks/get_page above): on a
+      // multi-source brain the ingest event must be attributed to the caller's
+      // source, not the shared 'default' bucket. Absent sourceId still falls to
+      // the engine's 'default' (single-source brains unchanged).
+      ...(ctx.sourceId ? { source_id: ctx.sourceId } : {}),
       source_type: p.source_type as string,
       source_ref: p.source_ref as string,
       pages_updated: p.pages_updated as string[],
@@ -2695,7 +2793,17 @@ const get_ingest_log: Operation = {
     limit: { type: 'number', description: 'Max entries (default 20)' },
   },
   handler: async (ctx, p) => {
-    return ctx.engine.getIngestLog({ limit: clampSearchLimit(p.limit as number | undefined, 20, 50) });
+    // Source-scope the log for remote callers (scalar grant → single-element
+    // array; federated grant → the granted array — linkReadScopeOpts collapse
+    // rule). Trusted local callers (remote === false) keep the whole-brain
+    // view, matching every other read op's local posture. Ingest summaries
+    // can carry another source's private context, so an unscoped remote read
+    // is a cross-source leak.
+    const scope = ctx.remote !== false ? linkReadScopeOpts(ctx) : {};
+    return ctx.engine.getIngestLog({
+      limit: clampSearchLimit(p.limit as number | undefined, 20, 50),
+      ...(scope.sourceIds ? { sourceIds: scope.sourceIds } : scope.sourceId ? { sourceIds: [scope.sourceId] } : {}),
+    });
   },
   scope: 'read',
 };
@@ -3293,7 +3401,7 @@ const get_calibration_profile: Operation = {
     holder: {
       type: 'string',
       description:
-        "Holder slug, e.g. 'garry' or 'people/charlie-example'. Defaults to 'garry' when omitted.",
+        "Holder slug, e.g. 'self' or 'people/charlie-example'. Defaults to config emotional_weight.user_holder, else 'self', when omitted.",
     },
   },
   handler: async (ctx, p) => {
@@ -3717,9 +3825,10 @@ const whoami: Operation = {
     'Introspect the calling identity. Returns one of three transport shapes: ' +
     '{transport: "oauth", client_id, client_name, scopes, expires_at}, ' +
     '{transport: "legacy", token_name, scopes, expires_at: null}, or ' +
-    '{transport: "local", scopes: []}. Throws unknown_transport when the ' +
-    'context is ambiguous (remote=true without auth) — fail-closed posture ' +
-    'mirroring the v0.26.9 trust-boundary contract.',
+    '{transport: "local", scopes: []}, or {transport: "stdio", scopes: []} ' +
+    'for the auth-less stdio MCP pipe. Throws unknown_transport when the ' +
+    'context is ambiguous (remote=true without auth and no transport marker) ' +
+    '— fail-closed posture mirroring the v0.26.9 trust-boundary contract.',
   params: {},
   scope: 'read',
   handler: async (ctx) => {
@@ -3730,6 +3839,12 @@ const whoami: Operation = {
     // special-case `transport: 'local'` explicitly.
     if (ctx.remote === false) {
       return { transport: 'local', scopes: [] };
+    }
+    // #1061: stdio MCP is remote/untrusted by design but has no per-token
+    // auth (local pipe) — a known transport, not a bug. Report it instead of
+    // throwing. Empty scopes: nothing here may be used to gate anything.
+    if (!ctx.auth && ctx.transport === 'stdio') {
+      return { transport: 'stdio', scopes: [] };
     }
     if (!ctx.auth) {
       throw new OperationError(
@@ -4417,14 +4532,10 @@ const search_by_image: Operation = {
       throw new Error('search_by_image accepts only one of: image_path, image_url, image_data');
     }
 
-    // D23-#6 — pre-flight daily-budget check for remote OAuth clients.
-    // Local CLI callers (ctx.remote=false) bypass the cap (clientId="").
+    // D23-#6 — remote OAuth clients are charged through the durable
+    // reserve-then-settle ledger below. Local CLI callers bypass the cap
+    // (clientId="") because they use their own provider credentials.
     const clientId = (ctx.remote === true ? (ctx.auth?.clientId ?? '') : '');
-    if (clientId) {
-      const budgetUsd = await getDailyImageBudgetUsd(ctx.engine);
-      const { checkBudget } = await import('./spend-log.ts');
-      await checkBudget(ctx.engine, clientId, Math.round(budgetUsd * 100));
-    }
 
     // Resolve image bytes via the SSRF-defended loader. For remote callers,
     // tighter byte cap.
@@ -4444,33 +4555,75 @@ const search_by_image: Operation = {
     // one spread — `__all__` spans the brain only for trusted local callers.
     const imageSourceScope = resolveRequestedScope(ctx, sourceIdParam);
 
-    const { searchByImage } = await import('./search/by-image.ts');
-    const results = await searchByImage(
-      ctx.engine,
-      { base64: loaded.base64, mime: loaded.contentType },
-      {
-        limit: (p.limit as number) || 20,
-        offset: (p.offset as number) || 0,
-        query: queryRefinement,
-        ...imageSourceScope,
-      },
-    );
-
-    // D23-#6 — record successful Voyage call. Best-effort; failures don't
-    // block the response.
+    // Reserve immediately before entering the paid search routine. Validation,
+    // image loading, and scope resolution happen first so known no-charge
+    // failures do not strand reservations. An ambiguous provider failure is
+    // settled at this operation's fixed-price upper bound below; pessimistic
+    // accounting is safer than reopening daily headroom after the TTL.
+    let spendReservationId: string | null = null;
+    let estimatedSpendCents = 0;
     if (clientId) {
-      const { recordSpend, VOYAGE_MULTIMODAL_3_PER_IMAGE_CENTS } = await import('./spend-log.ts');
-      // Approximate: 1 image embed + (query ? 1 text embed : 0). Both are
-      // billed at the same per-call rate by Voyage.
+      const { VOYAGE_MULTIMODAL_3_PER_IMAGE_CENTS } = await import('./spend-log.ts');
+      const { reserve } = await import('./minions/budget-meter.ts');
       const calls = 1 + (queryRefinement ? 1 : 0);
-      void recordSpend(ctx.engine, {
+      estimatedSpendCents = VOYAGE_MULTIMODAL_3_PER_IMAGE_CENTS * calls;
+      const budgetUsd = await getDailyImageBudgetUsd(ctx.engine);
+      const reservation = await reserve(ctx.engine, {
         clientId,
-        tokenName: ctx.auth?.clientName ?? null,
-        operation: 'search_by_image',
-        spendCents: VOYAGE_MULTIMODAL_3_PER_IMAGE_CENTS * calls,
+        estimatedCents: estimatedSpendCents,
+        capCents: budgetUsd * 100,
         provider: 'voyage',
         model: 'voyage-multimodal-3',
       });
+      spendReservationId = reservation.reservationId;
+    }
+
+    const { searchByImage } = await import('./search/by-image.ts');
+    let results: Awaited<ReturnType<typeof searchByImage>>;
+    try {
+      results = await searchByImage(
+        ctx.engine,
+        { base64: loaded.base64, mime: loaded.contentType },
+        {
+          limit: (p.limit as number) || 20,
+          offset: (p.offset as number) || 0,
+          query: queryRefinement,
+          ...imageSourceScope,
+        },
+      );
+    } catch (providerError) {
+      if (spendReservationId) {
+        const { settle } = await import('./minions/budget-meter.ts');
+        try {
+          await settle(
+            ctx.engine,
+            spendReservationId,
+            estimatedSpendCents,
+            'search_by_image_error_pessimistic',
+            ctx.auth?.clientName ?? null,
+          );
+        } catch (accountingError) {
+          throw new AggregateError(
+            [providerError, accountingError],
+            'search_by_image provider call failed and its spend reservation could not be settled',
+          );
+        }
+      }
+      throw providerError;
+    }
+
+    // Settlement and the spend-log mirror commit in one transaction. A
+    // database/accounting failure blocks the response and leaves the pending
+    // reservation holding headroom rather than returning an unmetered success.
+    if (spendReservationId) {
+      const { settle } = await import('./minions/budget-meter.ts');
+      await settle(
+        ctx.engine,
+        spendReservationId,
+        estimatedSpendCents,
+        'search_by_image',
+        ctx.auth?.clientName ?? null,
+      );
     }
 
     return results;
@@ -4961,7 +5114,7 @@ const run_onboard: Operation = {
     // typo, the underlying queue.add would reject. Defense-in-depth.
     const result = await runRemediation(
       ctx.engine,
-      { targetScore, maxUsd },
+      { targetScore, maxUsd, extraRemediations: allowedExtras },
       {},
     );
 
