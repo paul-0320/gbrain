@@ -980,10 +980,14 @@ export function makeResolver(
 
       // Step 3: pg_trgm fuzzy title match — both modes. Tries each hint in
       // order; first hint with a ≥0.55 similarity match wins. If no hints,
-      // try the whole pages table.
+      // try the whole pages table. When opts.sourceId is set, the fuzzy
+      // search is constrained to that source (and skips soft-deleted pages)
+      // so cross-source slug suggestions don't get silently dropped at the
+      // FK filter downstream. Mirrors the same scope fix `tryFuzzyMatch` got
+      // via #1436.
       const searchHints = hints.length > 0 ? hints : [undefined];
       for (const hint of searchHints) {
-        const match = await engine.findByTitleFuzzy(trimmed, hint, 0.55);
+        const match = await engine.findByTitleFuzzy(trimmed, hint, 0.55, opts.sourceId);
         if (match) {
           cache.set(cacheKey, match.slug);
           return match.slug;
@@ -1170,6 +1174,31 @@ export function parseTimelineEntries(content: string): TimelineCandidate[] {
     }
     result.push({ date, summary, detail: detailLines.join(' ').trim() });
     i = j;
+  }
+
+  // Format 3: inline citation — [Source: <source>, YYYY-MM-DD]. The citation
+  // convention gbrain's own quality rules require on every brain write;
+  // until now this parser (the db-source extract + ingest path) could not
+  // see it, so a page whose dates all live in citations scored zero
+  // timeline coverage. Kept in sync with extractTimelineFromContent's
+  // Format 3 (the fs-source path). Lines already captured by the timeline
+  // bullet pass are skipped (a bullet often carries its own citation).
+  const citationRe = /\[Source:\s*([^\]]+?),\s*(\d{4}-\d{2}-\d{2})\s*\]/g;
+  for (const line of lines) {
+    if (TIMELINE_LINE_RE.test(line)) continue;
+    const matches = [...line.matchAll(citationRe)];
+    if (matches.length === 0) continue;
+    const summary = line
+      .replace(/\[Source:[^\]]*\]/g, '')
+      .replace(/^[-*>#\s]+/, '')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, 300);
+    if (!summary) continue;
+    for (const m of matches) {
+      if (!isValidDate(m[2])) continue;
+      result.push({ date: m[2], summary, detail: `Source: ${m[1].trim().slice(0, 200)}` });
+    }
   }
   return result;
 }

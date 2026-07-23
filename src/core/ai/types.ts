@@ -55,6 +55,16 @@ export interface EmbeddingTouchpoint {
    */
   safety_factor?: number;
   /**
+   * Maximum number of inputs per embedding request. Some endpoints enforce a
+   * hard COUNT cap independent of token budget — notably llama.cpp's
+   * `llama-server`, which rejects requests with more inputs than its launch
+   * batch size (e.g. `batch size 100 > maximum allowed batch size 32`). The
+   * token-budget pre-split cannot bound item count (many tiny chunks fit under
+   * any token budget), so this is enforced as a separate hard re-split after
+   * the token split. When unset, no count cap is applied.
+   */
+  max_batch_items?: number;
+  /**
    * v0.27.1: when true, at least one model in this recipe accepts image
    * inputs via a multimodal embedding endpoint (e.g. Voyage's
    * /v1/multimodalembeddings). Drives gateway.embedMultimodal() routing.
@@ -327,6 +337,18 @@ export interface Recipe {
     fetch?: typeof fetch;
   };
   /**
+   * Optional inbound-response rewriter for openai-compatible recipes whose wire
+   * shape needs normalizing before the AI SDK adapter parses it. `fetch` wraps
+   * the transport and MUST be fail-open (return the original response on any
+   * error). Used by DeepSeek to promote `reasoning_content` into `content` when
+   * the reasoner returns an empty `content` (the adapter reads only `content`).
+   * Applied by `applyOpenAICompatConfig`; a `resolveOpenAICompatConfig`-provided
+   * fetch takes precedence when both are present.
+   */
+  compat?: {
+    fetch?: typeof fetch;
+  };
+  /**
    * v0.32 (D13=A): optional runtime readiness check for local-server
    * recipes (ollama, llama-server, future lmstudio-recipe). Returns
    * `ready: false` when the local endpoint isn't reachable, with a `hint`
@@ -377,6 +399,8 @@ export interface AIGatewayConfig {
   chat_fallback_chain?: string[];
   /** Optional per-provider base URL override (openai-compatible variants). */
   base_urls?: Record<string, string>;
+  /** Optional chat providerOptions overrides keyed by recipe id or "recipe:modelId". */
+  provider_chat_options?: Record<string, Record<string, unknown>>;
   /** Env snapshot read once at configuration time. Gateway never reads process.env at call time. */
   env: Record<string, string | undefined>;
 }

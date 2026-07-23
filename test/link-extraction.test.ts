@@ -1236,6 +1236,43 @@ describe('makeResolver — fallback chain', () => {
     const out = await r.resolveBasenameMatches!('struktura');
     expect(out.sort()).toEqual(['notes/struktura', 'struktura']);
   });
+
+  test('opts.sourceId is forwarded to findByTitleFuzzy (twin of #1436 fix)', async () => {
+    // Captures every (name, dirPrefix, minSimilarity, sourceId) call so we
+    // can assert the resolver threads sourceId through. Without the wire-up,
+    // findByTitleFuzzy would be called with sourceId=undefined and the SQL
+    // could return cross-source slug suggestions that the FK filter
+    // downstream silently drops.
+    const calls: Array<{ name: string; dirPrefix?: string; minSimilarity?: number; sourceId?: string }> = [];
+    const engine = {
+      async getPage() { return null; },
+      async findByTitleFuzzy(name: string, dirPrefix?: string, minSimilarity?: number, sourceId?: string) {
+        calls.push({ name, dirPrefix, minSimilarity, sourceId });
+        return null;
+      },
+      async searchKeyword() { return []; },
+    } as unknown as BrainEngine;
+    const r = makeResolver(engine, { mode: 'batch', sourceId: 'src-a' });
+    await r.resolve('Alice Example', 'people');
+    expect(calls.length).toBeGreaterThan(0);
+    expect(calls.every(c => c.sourceId === 'src-a')).toBe(true);
+  });
+
+  test('opts.sourceId omitted → findByTitleFuzzy receives undefined (back-compat)', async () => {
+    const calls: Array<{ sourceId?: string }> = [];
+    const engine = {
+      async getPage() { return null; },
+      async findByTitleFuzzy(_name: string, _dirPrefix?: string, _min?: number, sourceId?: string) {
+        calls.push({ sourceId });
+        return null;
+      },
+      async searchKeyword() { return []; },
+    } as unknown as BrainEngine;
+    const r = makeResolver(engine, { mode: 'batch' });
+    await r.resolve('Alice Example', 'people');
+    expect(calls.length).toBeGreaterThan(0);
+    expect(calls.every(c => c.sourceId === undefined)).toBe(true);
+  });
 });
 
 describe('FRONTMATTER_LINK_MAP integrity', () => {
@@ -1336,3 +1373,29 @@ describe("v0.18.0 migration v22 — links_resolution_type", () => {
   });
 });
 
+
+describe('parseTimelineEntries — Format 3: inline [Source: ..., YYYY-MM-DD] citations', () => {
+  test('extracts an entry from a dated citation', () => {
+    const entries = parseTimelineEntries('Closed the seed round. [Source: board notes, 2025-04-02]');
+    expect(entries).toHaveLength(1);
+    expect(entries[0].date).toBe('2025-04-02');
+    expect(entries[0].summary).toBe('Closed the seed round.');
+    expect(entries[0].detail).toBe('Source: board notes');
+  });
+
+  test('keeps commas inside the citation source', () => {
+    const entries = parseTimelineEntries('Alice joined. [Source: email re: offer, signed, 2025-05-10]');
+    expect(entries).toHaveLength(1);
+    expect(entries[0].detail).toBe('Source: email re: offer, signed');
+  });
+
+  test('does not double-extract a timeline bullet carrying its own citation', () => {
+    const entries = parseTimelineEntries('- **2025-03-18** | Meeting notes [Source: notes, 2025-03-18]');
+    expect(entries).toHaveLength(1); // bullet pass only
+  });
+
+  test('skips invalid calendar dates and bare citations', () => {
+    expect(parseTimelineEntries('Claim. [Source: memo, 2026-13-45]')).toHaveLength(0);
+    expect(parseTimelineEntries('[Source: import batch, 2025-07-01]')).toHaveLength(0);
+  });
+});
