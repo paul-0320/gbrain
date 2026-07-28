@@ -185,8 +185,9 @@ const TOKEN_CAP_CUT_LOOKBACK = 300;
  * Cut placement prefers, within the last TOKEN_CAP_CUT_LOOKBACK chars of
  * the window: a newline, then any whitespace, then a hard cut. This keeps
  * forced splits off mid-line/mid-URL positions for list-shaped content
- * and inside code fences. No overlap is added (pieces stay lossless
- * modulo the trims the char cap already applies).
+ * and inside code fences. No overlap is added; pieces reassemble
+ * byte-for-byte (`pieces.join('') === text`) — boundary whitespace is
+ * kept with the leading piece, never dropped.
  *
  * @internal exported for the code chunker (code.ts) and tests.
  */
@@ -224,7 +225,7 @@ export function capByEstimatedTokens(text: string, maxTokens: number): string[] 
       if (cut >= windowStart) end = cut + 1;
     }
 
-    const slice = text.slice(start, end).trim();
+    const slice = text.slice(start, end);
     if (slice.length > 0) out.push(slice);
     start = end;
   }

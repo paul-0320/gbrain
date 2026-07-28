@@ -155,12 +155,25 @@ describe('capByEstimatedTokens unit behavior', () => {
     const text = Array.from({ length: 40 }, () => line).join('\n');
     const pieces = capByEstimatedTokens(text, 1000);
     expect(pieces.length).toBeGreaterThan(1);
+    expect(pieces.join('')).toBe(text);
     for (const p of pieces) {
-      // Every piece should be whole lines (multiples of the 100-char line).
-      for (const l of p.split('\n')) {
+      // Every piece should be whole lines (multiples of the 100-char line);
+      // a cut piece carries its trailing newline, so filter the empty tail.
+      for (const l of p.split('\n').filter((s) => s.length > 0)) {
         expect(l).toBe(line);
       }
     }
+  });
+
+  test('reassembles byte-for-byte — boundary whitespace survives cuts', () => {
+    // Regression (PR #2847 review, stigrunar): trim() on each forced-split
+    // piece dropped cut-boundary whitespace — 15,882 of 157,823 replayed
+    // production rows failed byte-for-byte reassembly.
+    const line = '  indented, with trailing spaces  ';
+    const doc = Array.from({ length: 200 }, () => line).join('\n');
+    const pieces = capByEstimatedTokens(doc, 500);
+    expect(pieces.length).toBeGreaterThan(1);
+    expect(pieces.join('')).toBe(doc);
   });
 
   test('makes forward progress on whitespace-less input (hard cut)', () => {
