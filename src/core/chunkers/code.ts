@@ -18,9 +18,9 @@
  * at runtime.
  */
 
-import { chunkText as recursiveChunk } from './recursive.ts';
+import { chunkText as recursiveChunk, capByEstimatedTokens } from './recursive.ts';
 import { buildQualifiedName } from './qualified-names.ts';
-import { CJK_SLUG_CHARS, CJK_RANGES_REGEX } from '../cjk.ts';
+import { CJK_SLUG_CHARS, CJK_RANGES_REGEX, estimateEmbeddingTokens } from '../cjk.ts';
 
 // Embed the tree-sitter runtime + per-language grammars as files.
 // `with { type: 'file' }` returns a path (string) at runtime. Bun bundles
@@ -178,6 +178,18 @@ export interface CodeChunkOptions {
    * smallest common embedder context (e.g. nomic-embed-text, 2048).
    */
   maxChunkTokens?: number;
+  /**
+   * Opt-in hard cap on any emitted chunk's ESTIMATED embedding tokens, for
+   * embedding backends with strict per-request token limits. Unlike
+   * `maxChunkTokens` (structural re-split triggered by the generic
+   * estimateTokens, ~3.5 chars/token — an underestimate for CJK and
+   * URL-dense text), this is measured with the conservative CJK-aware
+   * estimateEmbeddingTokens (cjk.ts) and enforced as a final pass, so it
+   * GUARANTEES the bound. UNSET (default): no final cap — behavior is
+   * identical to previous releases. Wired to the
+   * `embedding_max_chunk_tokens` config key by the import path.
+   */
+  maxEmbedTokens?: number;
 }
 
 /**
@@ -719,7 +731,13 @@ export async function chunkCodeTextFull(
     if (chunks.length === 0) {
       return { chunks: fallbackChunks(source, filePath, language, opts), edges: rawEdges };
     }
-    return { chunks: capOversizedChunks(mergeSmallSiblings(chunks, chunkTarget), filePath, language, opts), edges: rawEdges };
+    // Layer both caps when maxEmbedTokens is set. capOversizedChunks (#1675,
+    // CJK-aware since #3477) enforces the structural maxChunkTokens budget
+    // (default 2000); capCodeChunks enforces the stricter configured embed
+    // cap with estimateEmbeddingTokens and is a no-op when every chunk is
+    // already under it.
+    const astChunks = capOversizedChunks(mergeSmallSiblings(chunks, chunkTarget), filePath, language, opts);
+    return { chunks: opts.maxEmbedTokens ? capCodeChunks(astChunks, opts.maxEmbedTokens) : astChunks, edges: rawEdges };
   } catch {
     return { chunks: fallbackChunks(source, filePath, language, opts), edges: [] };
   } finally {
@@ -800,6 +818,33 @@ function mergeSmallSiblings(chunks: CodeChunk[], chunkTarget: number): CodeChunk
     i = j;
   }
   return merged;
+}
+
+/**
+ * Opt-in final safety pass for AST-path chunks
+ * (CodeChunkOptions.maxEmbedTokens): split any chunk whose ESTIMATED
+ * embedding tokens (conservative per-char-class heuristic, cjk.ts) exceed
+ * the cap. Reaches chunks the AST logic can't subdivide — splitLargeNode
+ * returns [] for nodes with < 2 body children (giant single-statement
+ * functions, huge literals), which ship whole at any size.
+ *
+ * Split pieces inherit the source chunk's metadata verbatim; start/end
+ * lines become approximate for pieces after the first. Acceptable —
+ * these chunks exist for embedding + retrieval, and the alternative is
+ * an embedding request the server rejects (or worse, crashes on).
+ */
+function capCodeChunks(chunks: CodeChunk[], maxEmbedTokens: number): CodeChunk[] {
+  if (chunks.every((c) => estimateEmbeddingTokens(c.text) <= maxEmbedTokens)) {
+    return chunks;
+  }
+  const out: CodeChunk[] = [];
+  for (const c of chunks) {
+    const pieces = capByEstimatedTokens(c.text, maxEmbedTokens);
+    for (const piece of pieces) {
+      out.push({ ...c, text: piece, index: out.length, metadata: { ...c.metadata } });
+    }
+  }
+  return out;
 }
 
 function buildMergedChunk(group: CodeChunk[], index: number): CodeChunk {
@@ -928,7 +973,7 @@ function fallbackChunks(
 ): CodeChunk[] {
   const size = opts.fallbackChunkSizeWords ?? 300;
   const overlap = opts.fallbackOverlapWords ?? 50;
-  const chunks = recursiveChunk(source, { chunkSize: size, chunkOverlap: overlap }).map((chunk, index) =>
+  const chunks = recursiveChunk(source, { chunkSize: size, chunkOverlap: overlap, maxEmbedTokens: opts.maxEmbedTokens }).map((chunk, index) =>
     buildChunk({
       body: chunk.text, filePath, language,
       symbolName: null, symbolType: 'module',
