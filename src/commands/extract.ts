@@ -35,7 +35,7 @@ import type { BrainEngine, LinkBatchInput, TimelineBatchInput } from '../core/en
 import type { PageType } from '../core/types.ts';
 import { parseMarkdown } from '../core/markdown.ts';
 import {
-  extractPageLinks, parseTimelineEntries, inferLinkType, makeResolver,
+  extractPageLinks, parseTimelineEntries, deriveTimelineAnchor, inferLinkType, makeResolver,
   extractFrontmatterLinks, isGlobalBasenameEnabled, LINK_EXTRACTOR_VERSION_TS,
   WIKILINK_BASENAME_LINK_TYPE,
   buildBasenameIndex, queryBasenameIndex, stripCodeBlocks,
@@ -433,7 +433,10 @@ export async function extractLinksFromFile(
       async resolve(name: string, dirHint?: string | string[]): Promise<string | null> {
         if (!name) return null;
         const trimmed = name.trim();
-        if (/^[a-z][a-z0-9-]*\/[a-z0-9][a-z0-9-]*$/.test(trimmed) && allSlugs.has(trimmed)) {
+        // Same broadened slug-shape as makeResolver step 1: accepts
+        // digit-leading folders (`90-people/nicolai`) and nested paths.
+        // Exact Set membership guards it — no false positives.
+        if (/\//.test(trimmed) && /^[a-z0-9][a-z0-9/_-]*$/.test(trimmed) && allSlugs.has(trimmed)) {
           return trimmed;
         }
         const hints = Array.isArray(dirHint) ? dirHint : (dirHint ? [dirHint] : []);
@@ -582,6 +585,17 @@ export interface ExtractOpts {
    * before (single-'default'-source brains unaffected).
    */
   sourceId?: string;
+  /**
+   * v0.42 — also extract frontmatter links on the incremental (slugs) path.
+   * `extractForSlugs` extracts BODY links only by default; set this true to also
+   * parse each changed page's frontmatter so `sources:`/`related:` edges stay fresh
+   * when YAML is edited externally and synced in. Applied PER changed page, so the
+   * incremental walk stays bounded (no switch to a full DB scan). Only honored on
+   * the incremental path (`slugs` defined); the full-walk path already covers
+   * frontmatter via its own dispatch. Gated upstream by the config key
+   * `autopilot.incremental_extract_include_frontmatter` (default off).
+   */
+  includeFrontmatter?: boolean;
 }
 
 /**
@@ -620,7 +634,7 @@ export async function runExtractCore(engine: BrainEngine, opts: ExtractOpts): Pr
       // Nothing changed — skip entirely.
       return result;
     }
-    const r = await extractForSlugs(engine, opts.dir, opts.slugs, opts.mode, dryRun, jsonMode, workers, opts.signal, opts.sourceId);
+    const r = await extractForSlugs(engine, opts.dir, opts.slugs, opts.mode, dryRun, jsonMode, workers, opts.signal, opts.sourceId, opts.includeFrontmatter);
     result.links_created = r.links_created;
     result.timeline_entries_created = r.timeline_created;
     result.pages_processed = r.pages;
@@ -735,6 +749,12 @@ export async function runExtract(engine: BrainEngine, args: string[]) {
   // v0.41.18.0 (A11, T8): --from-meetings extracts timeline entries from
   // meeting pages onto each discussed entity. Timeline subcommand only.
   const fromMeetings = args.includes('--from-meetings');
+  // --infer-dates: for pages whose body has NO parseable timeline line, anchor
+  // one entry at the page's computed effective_date (frontmatter / filename date,
+  // never the updated_at fallback). Default OFF for back-compat — comms/calendar
+  // brains opt in to populate timeline from slug/frontmatter dates. DB-source only
+  // (needs the full Page.effective_date, which getPage projects).
+  const inferDates = args.includes('--infer-dates');
   // v0.41.17.0 (T7, D9): --workers N parsed via the shared validator.
   // Honored on the fs-walk inner loops only; DB-source paths stay
   // serial in v0.41.17.0 (see ExtractOpts.workers doc).
@@ -949,7 +969,7 @@ Status (v0.42):
           result.pages_processed = r.pages;
         }
         if (subcommand === 'timeline' || subcommand === 'all') {
-          const r = await extractTimelineFromDB(engine, dryRun, jsonMode, typeFilter, since, { sourceIdFilter });
+          const r = await extractTimelineFromDB(engine, dryRun, jsonMode, typeFilter, since, { sourceIdFilter, inferDates });
           result.timeline_entries_created = r.created;
           result.pages_processed = Math.max(result.pages_processed, r.pages);
         }
@@ -1011,6 +1031,11 @@ async function extractForSlugs(
   signal?: AbortSignal,
   // #1747/#1503: stamp resolved brain source id on batch rows (see ExtractOpts.sourceId).
   sourceId?: string,
+  // v0.42: when true, also extract frontmatter links per changed page so
+  // externally-edited YAML (`sources:`/`related:`) stays fresh on the cycle.
+  // Default false preserves the body-only incremental behavior. Gated upstream
+  // by `autopilot.incremental_extract_include_frontmatter`.
+  includeFrontmatter: boolean = false,
 ): Promise<{ links_created: number; timeline_created: number; pages: number }> {
   // Build the full slug set for link resolution (fast: just readdir, no file reads)
   const allFiles = walkMarkdownFiles(brainDir);
@@ -1089,7 +1114,7 @@ async function extractForSlugs(
         const content = readFileSync(fullPath, 'utf-8');
 
         if (doLinks) {
-          const links = await extractLinksFromFile(content, relPath, allSlugs, { globalBasename });
+          const links = await extractLinksFromFile(content, relPath, allSlugs, { globalBasename, includeFrontmatter });
           for (const link of links) {
             if (dryRun) {
               if (!jsonMode) console.log(`  ${link.from_slug} → ${link.to_slug} (${link.link_type})`);
@@ -1564,7 +1589,7 @@ async function extractTimelineFromDB(
   jsonMode: boolean,
   typeFilter: PageType | undefined,
   since: string | undefined,
-  opts?: { sourceIdFilter?: string },
+  opts?: { sourceIdFilter?: string; inferDates?: boolean },
 ): Promise<{ created: number; pages: number }> {
   // v0.32.8: listAllPageRefs enumerates (slug, source_id) pairs so we can
   // thread sourceId to getPage and addTimelineEntriesBatch. Pre-fix used
@@ -1573,6 +1598,7 @@ async function extractTimelineFromDB(
   // v0.37.7.0 #1204: when sourceIdFilter is set, scope the walk to one
   // source so federated brain users can extract per-source.
   const sourceIdFilter = opts?.sourceIdFilter;
+  const inferDates = opts?.inferDates ?? false;
   const allRefs = sourceIdFilter
     ? (await engine.listAllPageRefs()).filter(r => r.source_id === sourceIdFilter)
     : await engine.listAllPageRefs();
@@ -1612,7 +1638,19 @@ async function extractTimelineFromDB(
     }
 
     const fullContent = page.compiled_truth + '\n' + page.timeline;
-    const entries = parseTimelineEntries(fullContent);
+    let entries = parseTimelineEntries(fullContent);
+    // --infer-dates: pages with no in-body timeline line but a trustworthy
+    // content date (frontmatter / filename) get one anchor entry at that date.
+    // Applied ONLY on the zero-entry path so it never shadows a real timeline.
+    if (entries.length === 0 && inferDates) {
+      const anchor = deriveTimelineAnchor({
+        slug,
+        title: page.title,
+        effectiveDate: page.effective_date,
+        effectiveDateSource: page.effective_date_source,
+      });
+      if (anchor) entries = [anchor];
+    }
 
     for (const entry of entries) {
       if (dryRunSeen) {

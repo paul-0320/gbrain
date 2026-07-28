@@ -16,6 +16,7 @@
 import { readFileSync, lstatSync, type Stats } from 'fs';
 import { join, dirname, resolve } from 'path';
 import type { BrainEngine } from './engine.ts';
+import { isSourceFederated } from './sources-load.ts';
 import { SOURCE_ID_RE, isValidSourceId } from './source-id.ts';
 import { isTrustedDotfile, realpathOrResolve } from './path-confine.ts';
 
@@ -158,6 +159,33 @@ export async function resolveSourceId(
   // 6. Fallback: the seeded 'default' source. Always exists post-migration
   //    v16 so this is a safe terminal.
   return 'default';
+}
+
+/**
+ * Engine-free tiers (1-3) of the resolution chain: explicit flag →
+ * GBRAIN_SOURCE env → .gbrain-source dotfile walk. Used by the thin-client
+ * CLI path (#2098), which has no local engine to run tiers 4-6 or
+ * assertSourceExists against — the remote server enforces existence + grant.
+ * Returns null when no engine-free tier fires.
+ */
+export function resolveSourceIdEngineFree(
+  explicit: string | null | undefined,
+  cwd: string = process.cwd(),
+): string | null {
+  if (explicit) {
+    if (!SOURCE_ID_RE.test(explicit)) {
+      throw new Error(`Invalid --source value "${explicit}". Must match [a-z0-9-]{1,32}.`);
+    }
+    return explicit;
+  }
+  const env = process.env.GBRAIN_SOURCE;
+  if (env && env.length > 0) {
+    if (!SOURCE_ID_RE.test(env)) {
+      throw new Error(`Invalid GBRAIN_SOURCE value "${env}". Must match [a-z0-9-]{1,32}.`);
+    }
+    return env;
+  }
+  return readDotfileWalk(cwd);
 }
 
 /**
@@ -378,17 +406,23 @@ export async function localFederatedSourceIds(
   tier: SourceTier,
 ): Promise<string[] | undefined> {
   if (tier === 'flag' || tier === 'env' || tier === 'dotfile') return undefined;
-  let rows: Array<{ id: string }>;
+  let rows: Array<{ id: string; config: unknown; archived?: boolean }>;
   try {
-    rows = await engine.executeRaw<{ id: string }>(
-      `SELECT id FROM sources WHERE config->>'federated' = 'true' AND archived = false ORDER BY id`,
+    rows = await engine.executeRaw<{ id: string; config: unknown; archived?: boolean }>(
+      `SELECT id, config, archived FROM sources WHERE archived = false ORDER BY id`,
     );
   } catch {
-    rows = await engine.executeRaw<{ id: string }>(
-      `SELECT id FROM sources WHERE config->>'federated' = 'true' ORDER BY id`,
+    rows = await engine.executeRaw<{ id: string; config: unknown }>(
+      `SELECT id, config FROM sources ORDER BY id`,
     );
   }
-  const ids = [sourceId, ...rows.map((r) => r.id).filter((id) => id !== sourceId)];
+  const ids = [
+    sourceId,
+    ...rows
+      .filter((row) => row.archived !== true && isSourceFederated(row.config))
+      .map((row) => row.id)
+      .filter((id) => id !== sourceId),
+  ];
   return ids.length > 1 ? ids : undefined;
 }
 

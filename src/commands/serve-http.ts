@@ -1156,7 +1156,8 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       // Unified view: OAuth clients + legacy API keys
       const oauthClients = await sql`
         SELECT c.client_id as id, c.client_name as name, 'oauth' as auth_type,
-          c.grant_types, c.scope, c.created_at, c.token_ttl,
+          c.grant_types, c.scope, c.source_id, c.federated_read,
+          c.created_at, c.token_ttl,
           CASE WHEN c.deleted_at IS NOT NULL THEN 'revoked' ELSE 'active' END as status,
           (SELECT max(created_at) FROM mcp_request_log WHERE token_name = c.client_id) as last_used_at,
           (SELECT count(*)::int FROM mcp_request_log WHERE token_name = c.client_id) as total_requests,
@@ -1172,8 +1173,21 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
           (SELECT count(*)::int FROM mcp_request_log WHERE token_name = a.name AND created_at > now() - interval '24 hours') as requests_today
         FROM access_tokens a ORDER BY a.created_at DESC
       `;
-      res.json([...oauthClients, ...legacyKeys]);
+      res.json([
+        ...oauthClients,
+        ...legacyKeys.map((key) => ({ ...key, source_id: null, federated_read: [] })),
+      ]);
     } catch (e) {
+      res.status(503).json({ error: 'service_unavailable' });
+    }
+  });
+
+  app.get('/admin/api/sources', requireAdmin, async (_req: Request, res: Response) => {
+    try {
+      const { listSources } = await import('../core/sources-ops.ts');
+      const sources = await listSources(engine);
+      res.json(sources.map(({ id, name, federated }) => ({ id, name, federated })));
+    } catch {
       res.status(503).json({ error: 'service_unavailable' });
     }
   });
@@ -1564,6 +1578,38 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       res.json({ updated: true, tokenTtl: ttl });
     } catch (e) {
       res.status(500).json({ error: e instanceof Error ? e.message : 'Update failed' });
+    }
+  });
+
+  // v0.42.x (#1914): rescope an OAuth client's write source / federated read
+  // scope. Admin-gated on purpose — DCR clients must never self-widen their
+  // scope (fail-closed trust); only the operator rescopes, here or via
+  // `gbrain auth rescope-client`. Source ids are validated by the canonical
+  // validator inside rescopeClient.
+  app.post('/admin/api/rescope-client', requireAdmin, express.json(), async (req: Request, res: Response) => {
+    try {
+      const { clientId, sourceId, federatedRead } = req.body ?? {};
+      if (!clientId || typeof clientId !== 'string') {
+        res.status(400).json({ error: 'clientId required' });
+        return;
+      }
+      if (federatedRead !== undefined &&
+          !(Array.isArray(federatedRead) && federatedRead.every((s: unknown) => typeof s === 'string'))) {
+        res.status(400).json({ error: 'federatedRead must be an array of source id strings' });
+        return;
+      }
+      if (sourceId !== undefined && typeof sourceId !== 'string') {
+        res.status(400).json({ error: 'sourceId must be a string' });
+        return;
+      }
+      const result = await oauthProvider.rescopeClient(clientId, { sourceId, federatedRead });
+      res.json(result);
+    } catch (e) {
+      const message = e instanceof Error ? e.message : 'Rescope failed';
+      const status = /No OAuth client found/.test(message) ? 404
+        : /Invalid source_id|requires --source|cannot be empty|does not exist/.test(message) ? 400
+        : 500;
+      res.status(status).json({ error: message });
     }
   });
 
@@ -2217,8 +2263,10 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
   //     Other event types (ping, pull_request, etc.) return 202 'ignored'
   //     so GitHub doesn't retry.
   // D15.5: HMAC compare uses the shared safeHexEqual helper.
-  // D18: submits 'sync' job with auto_embed_backfill=true and priority -10
-  //     (above autopilot's 0).
+  // D18: submits 'sync' job with extraction + auto_embed_backfill enabled and
+  //     priority -10 (above autopilot's 0). This opts normal incremental pushes
+  //     into sync's inline extraction while pagesAffected still identifies the
+  //     changed pages. The sync core can still defer large (>100) changes.
   // ---------------------------------------------------------------------------
   const githubWebhookLimiter = rateLimit({
     windowMs: 60_000,
@@ -2338,6 +2386,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
           'sync',
           {
             sourceId: source.id,
+            noExtract: false,
             auto_embed_backfill: true,
             embed_reason: 'webhook',
           },
