@@ -1606,6 +1606,50 @@ export interface EmbedOpts {
   dimensions?: number;
 }
 
+// ---- Query-side instruction prefix (fork: qwen3-mrl-support) ----
+//
+// Qwen3-Embedding is an asymmetric instruction-tuned family: the QUERY side is
+// trained on an `Instruct: {task}\nQuery:{query}` template while the document
+// side stays raw. The model card reports a 1-5% retrieval drop when the
+// query-side instruction is omitted. gbrain embeds every stored chunk raw
+// (document side — correct), so prepending the template at query time needs no
+// re-embedding: stored vectors, chunk_text, FTS, snippets and reranker inputs
+// are all untouched (same input-only invariant as the contextual-retrieval
+// wrapper in embedding-context.ts).
+//
+// Scope: qwen3-embedding model ids only — the same family match as
+// dimsProviderOptions' Matryoshka branch (dims.ts). Hosted Qwen3 derivatives
+// that take a server-side instruct parameter (e.g. DashScope
+// text-embedding-v4) have different model ids and are not touched.
+//
+// `GBRAIN_QUERY_INSTRUCT` overrides the task sentence; an empty string
+// disables the prefix entirely (operational kill switch / A-B lever). Read
+// per call — a deliberate, narrow exception to the C3 no-env-at-call-time
+// rule: this is an operational toggle, not provider config, and a call-time
+// read keeps one-shot CLI A/B runs and tests seam-free. NOTE: the effective
+// sentence changes the query-vector space — purge query_cache when changing
+// it under a long-lived serve process.
+//
+// Default: Korean task sentence — on our 38-question Korean corpus eval it
+// beat no-prefix 14/1 (sign test p=0.001) while the English model-card
+// default was not significant (2026-07-29 measurement).
+const QUERY_INSTRUCT_DEFAULT = '주어진 질문에 답이 되는 사내 문서를 검색하라';
+
+function isQwen3EmbeddingModel(modelId: string): boolean {
+  return modelId === 'qwen3-embedding' || modelId.startsWith('qwen3-embedding:');
+}
+
+function applyQueryInstruct(
+  texts: string[],
+  modelId: string,
+  inputType: 'query' | 'document' | undefined,
+): string[] {
+  if (inputType !== 'query' || !isQwen3EmbeddingModel(modelId)) return texts;
+  const task = process.env.GBRAIN_QUERY_INSTRUCT ?? QUERY_INSTRUCT_DEFAULT;
+  if (task.trim() === '') return texts;
+  return texts.map(t => `Instruct: ${task}\nQuery:${t ?? ''}`);
+}
+
 export async function embed(texts: string[], opts?: EmbedOpts): Promise<Float32Array[]> {
   if (!texts || texts.length === 0) return [];
 
@@ -1617,7 +1661,10 @@ export async function embed(texts: string[], opts?: EmbedOpts): Promise<Float32A
   const resolveTarget = opts?.embeddingModel ?? getEmbeddingModel();
   const tracker = __budgetStore.getStore() ?? null;
   const { model, recipe, modelId } = await resolveEmbeddingProvider(resolveTarget);
-  const truncated = texts.map(t => (t ?? '').slice(0, MAX_CHARS));
+  // Prefix BEFORE the MAX_CHARS cap so the instruction template always
+  // survives truncation intact (queries are short; the cap is a safety net).
+  const truncated = applyQueryInstruct(texts, modelId, opts?.inputType)
+    .map(t => (t ?? '').slice(0, MAX_CHARS));
 
   // Reserve up front for the worst-case batch token count. Embeddings have
   // no output rate, so maxOutputTokens=0. record() at the end uses the
