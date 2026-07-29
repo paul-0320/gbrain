@@ -9,7 +9,7 @@ src/core/postgres-engine.ts	5816	ratchet	peel target: containment sprint C15; gr
 src/core/pglite-engine.ts	5744	ratchet	peel target: containment sprint C15; grown v0.46.11.0 five-issue wave + retrieval wave
 src/core/migrate.ts	668	region-exempt	append-only MIGRATIONS array grows freely; runner logic is ratcheted
 src/commands/sync.ts	4300	ratchet	peel target: containment sprint C13-C14; grown v0.46.11.0 five-issue wave
-src/core/ai/gateway.ts	4364	ratchet	watchlist; merged: master waves + dream-wave C1-C3+C7 (thinking predicate, length, providerMetadata, turn permits) + TurnPermit signal form
+src/core/ai/gateway.ts	4411	ratchet	watchlist; merged: master waves + dream-wave C1-C3+C7 (thinking predicate, length, providerMetadata, turn permits) + TurnPermit signal form; fork-carry (ymyd #3584 Qwen3 query-instruct prefix) +47 → 4411
 src/cli.ts	3482	ratchet	watchlist; merged unions: cathedral-5 compile-context wiring + gap-closure thin-client routing + cathedral-6 register guards + sources self-help
 src/core/cycle.ts	3030	ratchet
 src/commands/serve-http.ts	2978	ratchet	grown cathedral-6 multi-agent wave (admin register route composes registerScopedClient in one tx under the name advisory lock; ttl validation + brain_too_old preflight) + chennai no-grant federated scope
