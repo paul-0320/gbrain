@@ -151,26 +151,20 @@ describe('extractTrigramTokens — pure', () => {
 });
 
 describe('searchTrigram — PGLite engine arm', () => {
-  test('reaches a particle-suffixed mention that searchKeyword cannot (gap reproduced)', async () => {
+  test('reaches a particle- AND compound-hidden pair in one chunk (gap reproduced)', async () => {
     await seedVendorLog();
 
-    // The gap, asserted rather than assumed: the body writes "인터엠디는",
-    // never the bare base form, and the query carries a second token — so the
-    // lexeme-grain arm (and PGLite's whole-query CJK ILIKE fallback) miss it.
-    const keyword = await engine.searchKeyword('인터엠디 미팅', { orFallback: true });
+    // The gap, asserted rather than assumed. The body writes "인터엠디는"
+    // (particle-suffixed) and "카카오헬스케어와" (compound), so NEITHER base
+    // form is a standalone FTS lexeme: the keyword arm misses on strict AND,
+    // misses again on the OR relaxation (there is no lexeme to relax onto),
+    // and PGLite's whole-query CJK ILIKE finds no contiguous substring either.
+    const keyword = await engine.searchKeyword('인터엠디 카카오', { orFallback: true });
     expect(keyword.map((r) => r.slug)).not.toContain('notes/vendor-log');
 
-    const trigram = await engine.searchTrigram('인터엠디 미팅');
-    expect(trigram.map((r) => r.slug)).toContain('notes/vendor-log');
-  });
-
-  test('reaches a compound-only mention (카카오 → 카카오헬스케어)', async () => {
-    await seedVendorLog();
-
-    const keyword = await engine.searchKeyword('카카오 제휴', { orFallback: true });
-    expect(keyword.map((r) => r.slug)).not.toContain('notes/vendor-log');
-
-    const trigram = await engine.searchTrigram('카카오 제휴');
+    // The arm reaches it because BOTH operands match the SAME chunk —
+    // 인터엠디 at 0.80, 카카오 at 0.75 — meeting the co-occurrence floor.
+    const trigram = await engine.searchTrigram('인터엠디 카카오');
     expect(trigram.map((r) => r.slug)).toContain('notes/vendor-log');
   });
 
@@ -188,8 +182,8 @@ describe('searchTrigram — PGLite engine arm', () => {
 
   test('honors the page-grain filters — type filter narrows the arm', async () => {
     await seedVendorLog();
-    expect((await engine.searchTrigram('인터엠디 미팅', { type: 'note' })).length).toBeGreaterThan(0);
-    expect(await engine.searchTrigram('인터엠디 미팅', { type: 'person' })).toEqual([]);
+    expect((await engine.searchTrigram('인터엠디 카카오', { type: 'note' })).length).toBeGreaterThan(0);
+    expect(await engine.searchTrigram('인터엠디 카카오', { type: 'person' })).toEqual([]);
   });
 
   test('returns one row per page (best-per-page dedup) across many matching chunks', async () => {
@@ -199,11 +193,11 @@ describe('searchTrigram — PGLite engine arm', () => {
       compiled_truth: VENDOR_BODY,
     });
     await engine.upsertChunks('notes/vendor-log', [
-      { chunk_index: 0, chunk_text: '인터엠디는 좋은 회사다.', chunk_source: 'compiled_truth' },
-      { chunk_index: 1, chunk_text: '인터엠디와 계약을 갱신했다.', chunk_source: 'timeline' },
-      { chunk_index: 2, chunk_text: '인터엠디에서 연락이 왔다.', chunk_source: 'timeline' },
+      { chunk_index: 0, chunk_text: '인터엠디는 카카오헬스케어와 만났다.', chunk_source: 'compiled_truth' },
+      { chunk_index: 1, chunk_text: '인터엠디와 카카오벤처스가 계약을 갱신했다.', chunk_source: 'timeline' },
+      { chunk_index: 2, chunk_text: '인터엠디에서 카카오브레인으로 연락이 왔다.', chunk_source: 'timeline' },
     ]);
-    const trigram = await engine.searchTrigram('인터엠디 미팅');
+    const trigram = await engine.searchTrigram('인터엠디 카카오');
     expect(trigram.filter((r) => r.slug === 'notes/vendor-log').length).toBe(1);
   });
 });
@@ -211,27 +205,27 @@ describe('searchTrigram — PGLite engine arm', () => {
 describe('hybridSearch — search.trigram_arm knob gate', () => {
   test('bundle default (off): the trigram arm contributes nothing', async () => {
     await seedVendorLog();
-    const results = await hybridSearch(engine, '인터엠디 미팅', { limit: 10 });
+    const results = await hybridSearch(engine, '인터엠디 카카오', { limit: 10 });
     expect(results.map((r) => r.slug)).not.toContain('notes/vendor-log');
   });
 
   test('search.trigram_arm=true fuses the arm end-to-end', async () => {
     await seedVendorLog();
     await engine.setConfig('search.trigram_arm', 'true');
-    const results = await hybridSearch(engine, '인터엠디 미팅', { limit: 10 });
+    const results = await hybridSearch(engine, '인터엠디 카카오', { limit: 10 });
     expect(results.map((r) => r.slug)).toContain('notes/vendor-log');
   });
 
   test('per-call trigram_arm:true wins over the (off) bundle default', async () => {
     await seedVendorLog();
-    const results = await hybridSearch(engine, '인터엠디 미팅', { limit: 10, trigram_arm: true });
+    const results = await hybridSearch(engine, '인터엠디 카카오', { limit: 10, trigram_arm: true });
     expect(results.map((r) => r.slug)).toContain('notes/vendor-log');
   });
 
   test('per-call trigram_arm:false wins over config=true', async () => {
     await seedVendorLog();
     await engine.setConfig('search.trigram_arm', 'true');
-    const results = await hybridSearch(engine, '인터엠디 미팅', { limit: 10, trigram_arm: false });
+    const results = await hybridSearch(engine, '인터엠디 카카오', { limit: 10, trigram_arm: false });
     expect(results.map((r) => r.slug)).not.toContain('notes/vendor-log');
   });
 });
@@ -389,13 +383,22 @@ describe('searchTrigram — corpus-frequency gate', () => {
     expect(await engine.searchTrigram('자동 실행')).toEqual([]);
   });
 
-  test('a mixed query keeps the rare operand and still reaches its page', async () => {
+  test('flood + ONE rare operand → silence (nothing left to co-occur with)', async () => {
     await seedFloodCorpus();
     await seedVendorLog();
 
-    const hits = await engine.searchTrigram('자동 인터엠디');
+    // 자동 is gated away as a flood term, leaving 인터엠디 alone. A lone
+    // operand can never meet the co-occurrence floor, so the arm never runs.
+    expect(await engine.searchTrigram('자동 인터엠디')).toEqual([]);
+  });
+
+  test('flood + TWO rare operands → the survivors still reach their page', async () => {
+    await seedFloodCorpus();
+    await seedVendorLog();
+
+    const hits = await engine.searchTrigram('자동 인터엠디 카카오');
     const slugs = hits.map((r) => r.slug);
-    // The rare operand survives and does its job …
+    // The two rare operands survive the gate and co-occur in the vendor chunk …
     expect(slugs).toContain('notes/vendor-log');
     // … while the flood operand no longer drags in the 60-chunk bulk page.
     expect(slugs).not.toContain('notes/bulk-log');
@@ -418,7 +421,9 @@ describe('searchTrigram — corpus-frequency gate', () => {
       })),
     );
 
-    const hits = await engine.searchTrigram('주말 점검');
+    // Both operands appear in every chunk (주말에는 / 배치를), so the
+    // co-occurrence floor is met and the DF gate is the only thing under test.
+    const hits = await engine.searchTrigram('주말 배치');
     expect(hits.map((r) => r.slug)).toContain('notes/weekend-log');
   });
 });
@@ -433,13 +438,89 @@ describe('hybridSearch — the gate makes an all-flood query a no-op', () => {
     expect(on.map((r) => r.slug)).toEqual(off.map((r) => r.slug));
   });
 
-  test('a mixed query still gains the rare operand’s reach with the arm on', async () => {
+  test('a mixed query still gains the surviving operands’ reach with the arm on', async () => {
     await seedFloodCorpus();
     await seedVendorLog();
 
-    const off = await hybridSearch(engine, '자동 인터엠디', { limit: 10 });
-    const on = await hybridSearch(engine, '자동 인터엠디', { limit: 10, trigram_arm: true });
+    const off = await hybridSearch(engine, '자동 인터엠디 카카오', { limit: 10 });
+    const on = await hybridSearch(engine, '자동 인터엠디 카카오', { limit: 10, trigram_arm: true });
     expect(off.map((r) => r.slug)).not.toContain('notes/vendor-log');
     expect(on.map((r) => r.slug)).toContain('notes/vendor-log');
+  });
+});
+
+// ───────────────────────────────────────────────────────────────────────────
+// Co-occurrence requirement.
+//
+// The DF gate alone lifted the 62-question gate from 45 to 53 answers found,
+// but the arm's OWN insurance metric went backward: particle-gap rescue fell
+// 96.7% → 86.7%. A surviving-but-not-rare noun still scores ~1.0 against every
+// page containing it, so a single-token match produces "pages that share a
+// word, in arbitrary order" and those siblings crowd out the true answer in
+// RRF. Requiring two DISTINCT operands in the same chunk is what restores
+// discrimination — and it deliberately silences single-noun lookups, which
+// belong to the substring `search` operation instead.
+// ───────────────────────────────────────────────────────────────────────────
+
+describe('searchTrigram — co-occurrence requirement', () => {
+  test('a single surviving operand silences the arm entirely', async () => {
+    await seedVendorLog();
+
+    // One operand: nothing to co-occur with, so no query runs at all.
+    expect(await engine.searchTrigram('인터엠디')).toEqual([]);
+    // Two operands where only ONE can ever match is the same story — the arm
+    // runs but no chunk clears the floor.
+    expect(await engine.searchTrigram('인터엠디 블록체인')).toEqual([]);
+  });
+
+  test('a single-operand query leaves hybridSearch identical to the arm-off run', async () => {
+    await seedVendorLog();
+
+    const off = await hybridSearch(engine, '인터엠디', { limit: 10 });
+    const on = await hybridSearch(engine, '인터엠디', { limit: 10, trigram_arm: true });
+    expect(on.map((r) => r.slug)).toEqual(off.map((r) => r.slug));
+  });
+
+  test('only chunks matching BOTH operands qualify — one-token siblings are excluded', async () => {
+    // Two pages sharing ONE operand. Only the page whose chunk carries both
+    // may appear; the sibling is exactly the noise that sank the 2nd round.
+    await engine.putPage('notes/both-tokens', {
+      type: 'note',
+      title: 'Both Tokens',
+      compiled_truth: '인터엠디는 카카오헬스케어와 만났다.',
+    });
+    await engine.upsertChunks('notes/both-tokens', [
+      { chunk_index: 0, chunk_text: '인터엠디는 카카오헬스케어와 만났다.', chunk_source: 'compiled_truth' },
+    ]);
+    await engine.putPage('notes/one-token', {
+      type: 'note',
+      title: 'One Token',
+      compiled_truth: '인터엠디는 분기 보고서를 보냈다.',
+    });
+    await engine.upsertChunks('notes/one-token', [
+      { chunk_index: 0, chunk_text: '인터엠디는 분기 보고서를 보냈다.', chunk_source: 'compiled_truth' },
+    ]);
+
+    const slugs = (await engine.searchTrigram('인터엠디 카카오')).map((r) => r.slug);
+    expect(slugs).toContain('notes/both-tokens');
+    expect(slugs).not.toContain('notes/one-token');
+  });
+
+  test('repeating one operand does not fake co-occurrence (DISTINCT operands)', async () => {
+    // Ten mentions of the same token is still ONE distinct operand matched.
+    await engine.putPage('notes/repeated', {
+      type: 'note',
+      title: 'Repeated Token',
+      compiled_truth: '인터엠디는 인터엠디와 인터엠디에서 인터엠디로 인터엠디를 인터엠디가 인터엠디에 인터엠디의 인터엠디도 인터엠디만.',
+    });
+    await engine.upsertChunks('notes/repeated', [
+      {
+        chunk_index: 0,
+        chunk_text: '인터엠디는 인터엠디와 인터엠디에서 인터엠디로 인터엠디를 인터엠디가 인터엠디에 인터엠디의 인터엠디도 인터엠디만.',
+        chunk_source: 'compiled_truth',
+      },
+    ]);
+
+    expect(await engine.searchTrigram('인터엠디 카카오')).toEqual([]);
   });
 });

@@ -173,6 +173,74 @@ export const TRIGRAM_DF_RATIO = 0.03;
 export const TRIGRAM_DF_MIN_COUNT = 50;
 
 /**
+ * How many DISTINCT surviving operands a chunk must match to become a
+ * candidate — and, equivalently, the minimum number of survivors needed for
+ * the arm to run at all.
+ *
+ * Why single-token matching had to go. The DF gate (above) removed the
+ * corpus-common operands, and the 62-question regression gate improved from 45
+ * to 53 answers found — but still lost 4, and the arm's own insurance metric
+ * went BACKWARD: particle-gap rescue fell from 96.7% to 86.7%. The arm was
+ * damaging the exact cases it exists to serve.
+ *
+ * The reason is that DF survival is not discrimination. "청크" survives the
+ * gate at 2.6%, but 2.6% of 22,351 chunks is still ~580 chunks, and
+ * `word_similarity` scores a bare ~1.0 against every one of them. A
+ * single-token match therefore produces "every page that happens to contain
+ * this noun, in arbitrary order" — and in RRF those sibling pages outrank the
+ * true answer often enough to push it out of the reranker's window. No
+ * threshold on a single token's frequency fixes this, because the problem is
+ * that one term cannot distinguish between documents that all contain it.
+ *
+ * Requiring two distinct operands in the SAME chunk restores discrimination:
+ * co-occurrence is rare where a single common noun is not, and the sum score
+ * now separates 2-match chunks from the 1-match siblings that no longer
+ * qualify at all.
+ *
+ * The deliberate consequence: single-noun lookups ("인터엠디") get NO trigram
+ * arm, ever. That is not a regression to fix — exact single-term lookup is the
+ * `search` operation's job (substring matching, which already reaches
+ * particle-suffixed forms). This arm is scoped to multi-term queries where
+ * chunk-grain FTS collapses.
+ */
+export const TRIGRAM_MIN_COOCCURRENCE = 2;
+
+/**
+ * Build the three token-dependent SQL expressions the arm needs, from the
+ * already-bound parameter references (`['$1','$2',…]`) of the SURVIVING
+ * operands.
+ *
+ * Shared by both engines rather than written twice, for the same reason
+ * `TRIGRAM_DF_PROBE_SQL` is: if the co-occurrence requirement drifted between
+ * Postgres and PGLite, one of them would silently keep admitting single-token
+ * matches — the exact failure this replaces.
+ *
+ *   matchClause     — the OR disjunction. Kept as the leading predicate
+ *                     because it is the form GIN gin_trgm_ops can prefilter
+ *                     with; the co-occurrence test is a filter on top, not a
+ *                     replacement, and cannot itself be index-driven.
+ *   cooccurrenceSql — `(CASE WHEN … THEN 1 ELSE 0 END + …) >= 2`. Counts
+ *                     DISTINCT operands matched, so a chunk repeating one
+ *                     token ten times still counts once and stays excluded.
+ *   scoreExpr       — unchanged sum of word_similarity. It only had to carry
+ *                     discrimination on its own while single matches were
+ *                     admitted; with a 2-match floor it ranks within an
+ *                     already-qualified set.
+ */
+export function buildTrigramPredicates(
+  tokenRefs: string[],
+  textColumn: string,
+): { matchClause: string; cooccurrenceSql: string; scoreExpr: string } {
+  return {
+    matchClause: tokenRefs.map((ref) => `${ref} <% ${textColumn}`).join(' OR '),
+    cooccurrenceSql:
+      `(${tokenRefs.map((ref) => `CASE WHEN ${ref} <% ${textColumn} THEN 1 ELSE 0 END`).join(' + ')})` +
+      ` >= ${TRIGRAM_MIN_COOCCURRENCE}`,
+    scoreExpr: tokenRefs.map((ref) => `word_similarity(${ref}, ${textColumn})`).join(' + '),
+  };
+}
+
+/**
  * Drop operands common enough to flood the arm's candidate list.
  *
  * Threshold: `count > max(TRIGRAM_DF_MIN_COUNT, TRIGRAM_DF_RATIO * total)`.

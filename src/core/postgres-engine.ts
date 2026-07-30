@@ -65,7 +65,7 @@ import { logConnectionEvent } from './connection-audit.ts';
 import { validateSlug, contentHash, rowToPage, rowToStalePage, rowToChunk, rowToSearchResult, parseEmbedding, tryParseEmbedding, takeRowToTake, takeHitRowToHit, isUndefinedTableError, warnOncePerProcess } from './utils.ts';
 import { resolveBoostMap, resolveHardExcludes } from './search/source-boost.ts';
 import { buildSourceFactorCase, buildHardExcludeClause, buildVisibilityClause, buildRecencyComponentSql, buildBestPerPagePoolCte, buildOrFallbackWebsearchQuery } from './search/sql-ranking.ts';
-import { extractTrigramTokens, dropFloodTokens, buildTrigramDfLikePattern, parseTrigramDfRows, TRIGRAM_DF_PROBE_SQL } from './search/trigram.ts';
+import { extractTrigramTokens, dropFloodTokens, buildTrigramDfLikePattern, parseTrigramDfRows, buildTrigramPredicates, TRIGRAM_DF_PROBE_SQL, TRIGRAM_MIN_COOCCURRENCE } from './search/trigram.ts';
 import { unverifiedExtractionFragment } from './extraction-review.ts';
 import { DEFAULT_EMBEDDING_MODEL, DEFAULT_EMBEDDING_DIMENSIONS } from './ai/defaults.ts';
 import { DELETE_BATCH_SIZE } from './engine-constants.ts';
@@ -1861,13 +1861,23 @@ export class PostgresEngine implements BrainEngine {
    * 57 → 45 answers found on a 62-question gate. Probe and main query share
    * ONE transaction, so the gate costs no extra connection round trip and
    * inherits the same 8s timeout.
+   *
+   * Co-occurrence requirement: a candidate chunk must match at least
+   * TRIGRAM_MIN_COOCCURRENCE (2) DISTINCT surviving operands, and the arm goes
+   * silent when fewer than two operands survive the frequency gate. The DF
+   * gate alone was not enough — it lifted the 62-question gate from 45 to 53
+   * answers found, but the arm's own particle-gap rescue rate FELL 96.7% →
+   * 86.7%, because a surviving-but-not-rare noun still scores ~1.0 against
+   * every page containing it and those siblings crowd out the true answer in
+   * RRF. One matched token cannot discriminate; two can.
    */
   async searchTrigram(query: string, opts?: SearchOpts): Promise<SearchResult[]> {
-    // No qualifying token → the arm contributes nothing. Return BEFORE any
-    // connection work: a disjunct-less WHERE clause would be a SQL error, and
-    // a no-op round-trip on every short/stopword query is pure latency.
+    // Fewer than TRIGRAM_MIN_COOCCURRENCE raw tokens can never satisfy the
+    // co-occurrence requirement, so return BEFORE any connection work — this
+    // also skips the DF probe on every single-noun query (the arm's silence
+    // there is by design; probing first would be pure latency).
     const tokens = extractTrigramTokens(query);
-    if (tokens.length === 0) return [];
+    if (tokens.length < TRIGRAM_MIN_COOCCURRENCE) return [];
 
     const limit = clampSearchLimit(opts?.limit);
     const offset = opts?.offset || 0;
@@ -1895,10 +1905,8 @@ export class PostgresEngine implements BrainEngine {
       // over the RIGHT one), so the query fragment must be on the left.
       const params: unknown[] = [...survivors];
       const tokenRefs = survivors.map((_, i) => `$${i + 1}`);
-      const trigramMatchClause = tokenRefs.map((ref) => `${ref} <% cc.chunk_text`).join(' OR ');
-      const trigramScoreExpr = tokenRefs
-        .map((ref) => `word_similarity(${ref}, cc.chunk_text)`)
-        .join(' + ');
+      const { matchClause: trigramMatchClause, cooccurrenceSql: trigramCooccurrenceSql, scoreExpr: trigramScoreExpr } =
+        buildTrigramPredicates(tokenRefs, 'cc.chunk_text');
 
       let typeClause = '';
       if (type) {
@@ -1970,6 +1978,13 @@ export class PostgresEngine implements BrainEngine {
           JOIN pages p ON p.id = cc.page_id
           JOIN sources s ON s.id = p.source_id
           WHERE (${trigramMatchClause})
+          -- Co-occurrence requirement: the OR disjunction above is the
+          -- GIN-prefilterable form, but on its own it admits chunks matching a
+          -- SINGLE operand — and word_similarity gives every chunk containing
+          -- that one noun the same ~1.0, so the arm degenerates into "pages
+          -- that share a word, in arbitrary order". Requiring two DISTINCT
+          -- operands in the same chunk is what makes the list discriminating.
+            AND ${trigramCooccurrenceSql}
             ${typeClause}
             ${typesClause}
             ${excludeSlugsClause}
@@ -2013,7 +2028,10 @@ export class PostgresEngine implements BrainEngine {
       );
       const { totalTextChunks, counts } = parseTrigramDfRows(dfRows as unknown as Record<string, unknown>[]);
       const survivors = dropFloodTokens(tokens, counts, totalTextChunks);
-      if (survivors.length === 0) return [];
+      // Fewer than two survivors → the arm stays silent, because a chunk can
+      // never satisfy the co-occurrence requirement. Single-term lookup is the
+      // `search` operation's job, not this arm's.
+      if (survivors.length < TRIGRAM_MIN_COOCCURRENCE) return [];
       const { sql, params } = buildQuery(survivors);
       return await tx.unsafe(sql, params as Parameters<typeof tx.unsafe>[1]);
     }, { alwaysTransaction: true });

@@ -969,15 +969,32 @@ export interface BrainEngine {
    *
    * This arm queries `content_chunks.chunk_text` with pg_trgm's
    * `word_similarity` (`<%`, GIN gin_trgm_ops-supported at the default 0.6
-   * threshold), scoring each candidate by the SUM of per-token similarities
-   * so a chunk matching several query tokens outranks one matching a single
-   * token. Chunk grain with the same page-dedup, filters, hard-excludes and
+   * threshold), scoring each candidate by the SUM of per-token similarities.
+   * Chunk grain with the same page-dedup, filters, hard-excludes and
    * visibility rules as searchKeyword, so rows fuse into hybridSearch's RRF
    * blend as a keyword-class list.
    *
+   * TWO admission requirements, both learned from regression measurement and
+   * both required for the arm to be net-positive:
+   *
+   *   1. Corpus-frequency gate — operands appearing in more than
+   *      `TRIGRAM_DF_RATIO` of text chunks are dropped. `word_similarity` has
+   *      no IDF, so a common noun scores ~1.0 against a quarter of the corpus.
+   *   2. Co-occurrence — a candidate chunk must match at least
+   *      `TRIGRAM_MIN_COOCCURRENCE` (2) DISTINCT surviving operands. A single
+   *      matched token cannot discriminate between the many documents that
+   *      also contain it, however rare that token is corpus-wide.
+   *
+   * Consequence callers must expect: the arm is SILENT for any query yielding
+   * fewer than two surviving operands — including every single-noun lookup.
+   * That is by design; exact single-term lookup is the `search` operation's
+   * job (substring matching, which already reaches particle-suffixed forms).
+   * This arm is scoped to multi-term queries where chunk-grain FTS collapses.
+   *
    * Returns `[]` without touching the database when the query yields no
-   * qualifying token (see `extractTrigramTokens`). Engines apply NO relaxation
-   * retry — a single query, or nothing.
+   * qualifying token (see `extractTrigramTokens`), and without running the
+   * main query when fewer than two operands survive the frequency gate.
+   * Engines apply NO relaxation retry — a single query, or nothing.
    */
   searchTrigram(query: string, opts?: SearchOpts): Promise<SearchResult[]>;
   searchVector(embedding: Float32Array, opts?: SearchOpts): Promise<SearchResult[]>;

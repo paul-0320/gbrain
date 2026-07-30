@@ -60,24 +60,26 @@ describePG('searchTrigram — Postgres engine arm', () => {
     expect(String(rows[0].indexdef)).toContain("modality = 'text'");
   });
 
-  test('reaches a particle-suffixed mention that searchKeyword cannot (gap reproduced)', async () => {
+  test('reaches a particle- AND compound-hidden pair in one chunk (gap reproduced)', async () => {
     const engine = getEngine();
 
-    const keyword = await engine.searchKeyword('인터엠디 미팅', { orFallback: true });
+    // Both base forms are hidden — "인터엠디는" carries a particle,
+    // "카카오헬스케어와" is a compound — so neither is a standalone lexeme.
+    // websearch_to_tsquery misses on strict AND and on the OR relaxation
+    // alike: there is no lexeme for the relaxed query to land on either.
+    const keyword = await engine.searchKeyword('인터엠디 카카오', { orFallback: true });
     expect(keyword.map((r) => r.slug)).not.toContain('notes/vendor-log');
 
-    const trigram = await engine.searchTrigram('인터엠디 미팅');
+    // The arm reaches it because both operands match the SAME chunk,
+    // satisfying the co-occurrence floor.
+    const trigram = await engine.searchTrigram('인터엠디 카카오');
     expect(trigram.map((r) => r.slug)).toContain('notes/vendor-log');
   });
 
-  test('reaches a compound-only mention (카카오 → 카카오헬스케어)', async () => {
+  test('a single surviving operand silences the arm', async () => {
     const engine = getEngine();
-
-    const keyword = await engine.searchKeyword('카카오 제휴', { orFallback: true });
-    expect(keyword.map((r) => r.slug)).not.toContain('notes/vendor-log');
-
-    const trigram = await engine.searchTrigram('카카오 제휴');
-    expect(trigram.map((r) => r.slug)).toContain('notes/vendor-log');
+    expect(await engine.searchTrigram('인터엠디')).toEqual([]);
+    expect(await engine.searchTrigram('인터엠디 블록체인')).toEqual([]);
   });
 
   test('an unrelated query still matches nothing (the arm is not a wildcard)', async () => {
@@ -93,8 +95,8 @@ describePG('searchTrigram — Postgres engine arm', () => {
 
   test('honors the page-grain type filter', async () => {
     const engine = getEngine();
-    expect((await engine.searchTrigram('인터엠디 미팅', { type: 'note' })).length).toBeGreaterThan(0);
-    expect(await engine.searchTrigram('인터엠디 미팅', { type: 'person' })).toEqual([]);
+    expect((await engine.searchTrigram('인터엠디 카카오', { type: 'note' })).length).toBeGreaterThan(0);
+    expect(await engine.searchTrigram('인터엠디 카카오', { type: 'person' })).toEqual([]);
   });
 
   // Corpus-frequency gate — the Postgres half. The probe rides inside the same
@@ -120,8 +122,12 @@ describePG('searchTrigram — Postgres engine arm', () => {
     // 61 text chunks → threshold = max(50, 1.83) = 50; 자동/실행 occur in 60.
     expect(await engine.searchTrigram('자동 실행')).toEqual([]);
 
-    // The rare operand still survives and reaches its page.
-    const mixed = await engine.searchTrigram('자동 인터엠디');
+    // One survivor is not enough to co-occur with anything …
+    expect(await engine.searchTrigram('자동 인터엠디')).toEqual([]);
+
+    // … but two rare survivors still reach their page without dragging in the
+    // 60-chunk bulk page the flood operand would have pulled.
+    const mixed = await engine.searchTrigram('자동 인터엠디 카카오');
     expect(mixed.map((r) => r.slug)).toContain('notes/vendor-log');
     expect(mixed.map((r) => r.slug)).not.toContain('notes/bulk-log');
   });

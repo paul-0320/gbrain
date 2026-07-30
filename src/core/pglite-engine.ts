@@ -58,7 +58,7 @@ import { finalizeLastSeen } from './chronicle/last-seen.ts';
 import { computeAnomaliesFromBuckets } from './cycle/anomaly.ts';
 import { resolveBoostMap, resolveHardExcludes } from './search/source-boost.ts';
 import { buildSourceFactorCase, buildHardExcludeClause, buildVisibilityClause, buildRecencyComponentSql, buildBestPerPagePoolCte, buildOrFallbackWebsearchQuery } from './search/sql-ranking.ts';
-import { extractTrigramTokens, dropFloodTokens, buildTrigramDfLikePattern, parseTrigramDfRows, TRIGRAM_DF_PROBE_SQL } from './search/trigram.ts';
+import { extractTrigramTokens, dropFloodTokens, buildTrigramDfLikePattern, parseTrigramDfRows, buildTrigramPredicates, TRIGRAM_DF_PROBE_SQL, TRIGRAM_MIN_COOCCURRENCE } from './search/trigram.ts';
 import { unverifiedExtractionFragment } from './extraction-review.ts';
 import { shouldExcludeFromOrphanReporting, loadOrphanPolicyOverrides } from './orphan-policy.ts';
 import { LINK_EXTRACTOR_VERSION_TS } from './link-extraction.ts';
@@ -1725,11 +1725,22 @@ export class PGLiteEngine implements BrainEngine {
    * rather than Postgres's shared transaction: PGLite is a single-writer
    * in-process engine, so this arm never needed the scoped-transaction
    * wrapper that the probe would otherwise have to join.
+   *
+   * Co-occurrence requirement: a candidate chunk must match at least
+   * TRIGRAM_MIN_COOCCURRENCE (2) DISTINCT surviving operands, and the arm goes
+   * silent when fewer than two operands survive the frequency gate. The DF
+   * gate alone was not enough — it lifted the 62-question gate from 45 to 53
+   * answers found, but the arm's own particle-gap rescue rate FELL 96.7% →
+   * 86.7%, because a surviving-but-not-rare noun still scores ~1.0 against
+   * every page containing it and those siblings crowd out the true answer in
+   * RRF. One matched token cannot discriminate; two can.
    */
   async searchTrigram(query: string, opts?: SearchOpts): Promise<SearchResult[]> {
-    // No qualifying token → contribute nothing, without a DB round-trip.
+    // Fewer than TRIGRAM_MIN_COOCCURRENCE raw tokens can never satisfy the
+    // co-occurrence requirement → contribute nothing, without a DB round-trip
+    // (skips the DF probe on every single-noun query — silence by design).
     const tokens = extractTrigramTokens(query);
-    if (tokens.length === 0) return [];
+    if (tokens.length < TRIGRAM_MIN_COOCCURRENCE) return [];
 
     const limit = clampSearchLimit(opts?.limit);
     const offset = opts?.offset || 0;
@@ -1751,10 +1762,8 @@ export class PGLiteEngine implements BrainEngine {
       // fragment is the LEFT operand of `<%`.
       const params: unknown[] = [...survivors];
       const tokenRefs = survivors.map((_, i) => `$${i + 1}`);
-      const trigramMatchClause = tokenRefs.map((ref) => `${ref} <% cc.chunk_text`).join(' OR ');
-      const trigramScoreExpr = tokenRefs
-        .map((ref) => `word_similarity(${ref}, cc.chunk_text)`)
-        .join(' + ');
+      const { matchClause: trigramMatchClause, cooccurrenceSql: trigramCooccurrenceSql, scoreExpr: trigramScoreExpr } =
+        buildTrigramPredicates(tokenRefs, 'cc.chunk_text');
       params.push(innerLimit);
       const innerLimitParam = `$${params.length}`;
       params.push(limit);
@@ -1816,7 +1825,12 @@ export class PGLiteEngine implements BrainEngine {
            FROM content_chunks cc
            JOIN pages p ON p.id = cc.page_id
            JOIN sources s ON s.id = p.source_id
-           WHERE (${trigramMatchClause}) ${detailFilter}${extraFilter} ${hardExcludeClause} ${visibilityClause}
+           WHERE (${trigramMatchClause})
+             -- Co-occurrence requirement — see postgres-engine.searchTrigram
+             -- for the rationale. The OR disjunction is the GIN-prefilterable
+             -- form; this filter is what stops single-operand matches from
+             -- flooding the list with same-word siblings.
+             AND ${trigramCooccurrenceSql} ${detailFilter}${extraFilter} ${hardExcludeClause} ${visibilityClause}
              AND cc.modality = 'text'
            ORDER BY score DESC
            LIMIT ${innerLimitParam}
@@ -1837,7 +1851,10 @@ export class PGLiteEngine implements BrainEngine {
     );
     const { totalTextChunks, counts } = parseTrigramDfRows(dfRows as Record<string, unknown>[]);
     const survivors = dropFloodTokens(tokens, counts, totalTextChunks);
-    if (survivors.length === 0) return [];
+    // Fewer than two survivors → the arm stays silent (see
+    // TRIGRAM_MIN_COOCCURRENCE): no chunk could satisfy the requirement, and
+    // single-term lookup belongs to the `search` operation.
+    if (survivors.length < TRIGRAM_MIN_COOCCURRENCE) return [];
 
     const { sql, params } = buildQuery(survivors);
     const { rows } = await this.db.query(sql, params);
