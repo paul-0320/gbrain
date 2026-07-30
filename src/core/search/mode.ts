@@ -83,6 +83,24 @@ export interface ModeBundle {
    */
   keywordOrFallback: boolean;
   /**
+   * Opt-in pg_trgm trigram recall arm (`search.trigram_arm`). OFF everywhere.
+   *
+   * The keyword and title arms both match whole FTS lexemes. Under an FTS
+   * config that cannot segment or stem CJK ('english' over Korean), a chunk
+   * that only ever writes a name with a particle attached ("인터엠디는") or
+   * fused into a compound ("카카오헬스케어") carries a lexeme the base-form
+   * query token never equals — unreachable lexically, and the AND→OR
+   * relaxation does not help because it relaxes at the same whole-lexeme
+   * grain. This arm adds a fourth candidate list scored by pg_trgm
+   * `word_similarity`, which matches those surface forms.
+   *
+   * Off by default: `word_similarity` has no IDF either, so on a Latin corpus
+   * (where stemming already works) it mostly adds fuzzy near-duplicates, and
+   * it costs one extra chunk-grain scan per search. Corpora that measured the
+   * surface-form gap turn it on.
+   */
+  trigram_arm: boolean;
+  /**
    * Per-call token budget cap (PR #897). undefined = no-op (tokenmax).
    * 4000 = tight (conservative, fits Haiku context loop).
    * 12000 = balanced (sweet-spot for Sonnet).
@@ -300,6 +318,7 @@ export const MODE_BUNDLES: Readonly<Record<SearchMode, Readonly<ModeBundle>>> = 
     cache_ttl_seconds: 3600,
     intentWeighting: true,
     keywordOrFallback: true,
+    trigram_arm: false,
     tokenBudget: 4000,
     expansion: false,
     searchLimit: 10,
@@ -345,6 +364,7 @@ export const MODE_BUNDLES: Readonly<Record<SearchMode, Readonly<ModeBundle>>> = 
     cache_ttl_seconds: 3600,
     intentWeighting: true,
     keywordOrFallback: true,
+    trigram_arm: false,
     tokenBudget: 12000,
     expansion: false,
     searchLimit: 25,
@@ -404,6 +424,7 @@ export const MODE_BUNDLES: Readonly<Record<SearchMode, Readonly<ModeBundle>>> = 
     cache_ttl_seconds: 3600,
     intentWeighting: true,
     keywordOrFallback: true,
+    trigram_arm: false,
     tokenBudget: undefined,
     expansion: true,
     searchLimit: 50,
@@ -469,6 +490,7 @@ export interface SearchKeyOverrides {
   cache_ttl_seconds?: number;
   intentWeighting?: boolean;
   keywordOrFallback?: boolean;
+  trigram_arm?: boolean;
   tokenBudget?: number;
   expansion?: boolean;
   searchLimit?: number;
@@ -519,6 +541,7 @@ export interface SearchPerCallOpts {
   cache_ttl_seconds?: number;
   intentWeighting?: boolean;
   keywordOrFallback?: boolean;
+  trigram_arm?: boolean;
   tokenBudget?: number;
   expansion?: boolean;
   searchLimit?: number;
@@ -620,6 +643,7 @@ export function resolveSearchMode(input: ResolveSearchModeInput): ResolvedSearch
     cache_ttl_seconds: pick('cache_ttl_seconds'),
     intentWeighting: pick('intentWeighting'),
     keywordOrFallback: pick('keywordOrFallback'),
+    trigram_arm: pick('trigram_arm'),
     tokenBudget: pick('tokenBudget'),
     expansion: pick('expansion'),
     searchLimit: pick('searchLimit'),
@@ -785,7 +809,11 @@ export function attributeKnob<K extends keyof ModeBundle>(
 // pattern as the bumps above.
 // bump 13→14: `kof=` (keyword AND→OR fallback knob) joins the key. Same
 // one-time global cold-miss pattern as the bumps above.
-export const KNOBS_HASH_VERSION = 14;
+// bump 14→15: `tga=` (opt-in pg_trgm trigram arm) joins the key. An arm-on
+// write blends a fourth candidate list into RRF, so its ranking — and often
+// its membership — differs from an arm-off run of the same query. Same
+// one-time global cold-miss pattern as the bumps above.
+export const KNOBS_HASH_VERSION = 15;
 
 /**
  * v0.36 (D8 / CDX-2) — second-arg context for the cache key. The
@@ -923,6 +951,16 @@ export function knobsHash(
     // disjoint (relaxed rows vs empty keyword arm). `?? true` mirrors the
     // module's defensive read of other knobs for partial-knobs callers.
     `kof=${(knobs.keywordOrFallback ?? true) ? 1 : 0}`,
+    // KNOBS_HASH_VERSION=15 addition (append-only): opt-in trigram arm.
+    // (Upstream numbering runs one ahead on this fork — see the `kof=`
+    // comment above, which shipped with the constant at 14.)
+    // An arm-on write fuses
+    // a fourth (pg_trgm) candidate list into RRF, so it can both re-rank the
+    // shared hits and surface pages the arm-off run never retrieved — serving
+    // one to the other is the same contamination class as graph_signals.
+    // `?? false` mirrors the module's defensive read of other knobs and keeps
+    // the DEFAULT (arm off) hashing identically for partial-knobs callers.
+    `tga=${(knobs.trigram_arm ?? false) ? 1 : 0}`,
   ];
   const h = createHash('sha256');
   h.update(parts.join('|'));
@@ -964,6 +1002,10 @@ export function loadOverridesFromConfig(
   const kof = get('search.keywordOrFallback');
   if (kof !== undefined) {
     out.keywordOrFallback = kof === '1' || kof.toLowerCase() === 'true';
+  }
+  const tga = get('search.trigram_arm');
+  if (tga !== undefined) {
+    out.trigram_arm = tga === '1' || tga.toLowerCase() === 'true';
   }
   const tb = get('search.tokenBudget');
   if (tb !== undefined) {
@@ -1115,6 +1157,7 @@ export const SEARCH_MODE_CONFIG_KEYS: ReadonlyArray<string> = Object.freeze([
   'search.cache.ttl_seconds',
   'search.intentWeighting',
   'search.keywordOrFallback',
+  'search.trigram_arm',
   'search.tokenBudget',
   'search.expansion',
   'search.searchLimit',

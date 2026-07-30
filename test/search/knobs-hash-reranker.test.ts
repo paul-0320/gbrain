@@ -67,7 +67,9 @@ describe('KNOBS_HASH_VERSION + version invariants', () => {
     // #3430: 13→14 — the compiled_truth boost no longer applies at
     // detail=medium. Results are cached after fusion, so rows ranked under
     // the old boost semantics must not be served under the new ones.
-    expect(KNOBS_HASH_VERSION).toBe(14);
+    // 14→15: `tga=` — the opt-in pg_trgm trigram arm fuses a fourth
+    // candidate list into RRF, so arm-on rows must not serve arm-off lookups.
+    expect(KNOBS_HASH_VERSION).toBe(15);
   });
 
   test('hash is 16 hex chars regardless of reranker config', () => {

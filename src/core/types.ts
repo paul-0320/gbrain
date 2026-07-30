@@ -1097,6 +1097,15 @@ export interface SearchOpts {
    */
   intentWeighting?: boolean;
   /**
+   * Opt-in pg_trgm trigram recall arm for this call (`search.trigram_arm`).
+   * Undefined → per-key config → mode bundle (off in all three). Set `true`
+   * to add the fourth candidate list — the arm that reaches CJK surface
+   * forms only ever written with a particle attached or inside a compound.
+   * Per-call value wins, and folds into knobsHash so an arm-on result set is
+   * never served from an arm-off cache row (or vice versa).
+   */
+  trigram_arm?: boolean;
+  /**
    * v0.35.0.0+: cross-encoder reranker config. Resolved from mode bundle by
    * default — tokenmax sets `enabled: true`, conservative + balanced set
    * `enabled: false`. Per-call SearchOpts.reranker overrides the mode

@@ -89,7 +89,7 @@ describe('alias_resolved boost stage', () => {
 });
 
 describe('KNOBS_HASH_VERSION', () => {
-  it('is 14 (13→14 compiled_truth boost no longer applies at detail=medium, so pre-fix rankings must be unreachable, #3430)', () => {
-    expect(KNOBS_HASH_VERSION).toBe(14);
+  it('is 15 (14→15 the opt-in pg_trgm trigram arm joins the key, so an arm-on ranking cannot serve an arm-off lookup)', () => {
+    expect(KNOBS_HASH_VERSION).toBe(15);
   });
 });

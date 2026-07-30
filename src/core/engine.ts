@@ -957,6 +957,29 @@ export interface BrainEngine {
    * chunk-grain AND FTS is weakest.
    */
   searchTitles(query: string, opts?: SearchOpts): Promise<SearchResult[]>;
+  /**
+   * Opt-in trigram recall arm (`search.trigram_arm`, default OFF).
+   *
+   * Both lexical arms above compare whole FTS lexemes. On an FTS config that
+   * cannot segment or stem CJK ('english' over Korean/Japanese/Chinese), a
+   * chunk that only ever spells a name with a particle attached ("인터엠디는")
+   * or inside a compound ("카카오헬스케어") holds a lexeme the base-form query
+   * token never equals — so it is unreachable by searchKeyword AND by its
+   * AND→OR relaxation, which still relaxes at whole-lexeme grain.
+   *
+   * This arm queries `content_chunks.chunk_text` with pg_trgm's
+   * `word_similarity` (`<%`, GIN gin_trgm_ops-supported at the default 0.6
+   * threshold), scoring each candidate by the SUM of per-token similarities
+   * so a chunk matching several query tokens outranks one matching a single
+   * token. Chunk grain with the same page-dedup, filters, hard-excludes and
+   * visibility rules as searchKeyword, so rows fuse into hybridSearch's RRF
+   * blend as a keyword-class list.
+   *
+   * Returns `[]` without touching the database when the query yields no
+   * qualifying token (see `extractTrigramTokens`). Engines apply NO relaxation
+   * retry — a single query, or nothing.
+   */
+  searchTrigram(query: string, opts?: SearchOpts): Promise<SearchResult[]>;
   searchVector(embedding: Float32Array, opts?: SearchOpts): Promise<SearchResult[]>;
   /**
    * Hydrate embeddings for chunks already known by id. v0.36 (D9):

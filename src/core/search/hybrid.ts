@@ -906,6 +906,11 @@ export async function hybridSearch(
       // would be a no-op (both branches resolve to the same mode default).
       relationalRetrieval: opts?.relationalRetrieval,
       relational_retrieval_depth: opts?.relationalRetrievalDepth,
+      // Opt-in trigram arm per-call thread-through. Per-call wins over config
+      // override wins over mode bundle (off in all three); without this thread
+      // an A/B eval gate would be a no-op because both branches would resolve
+      // to the same bundle default.
+      trigram_arm: opts?.trigram_arm,
     },
   });
 
@@ -1048,9 +1053,21 @@ export async function hybridSearch(
   // SIGNAL (Reviewer F2): a SQL error (e.g. a pre-search_vector brain)
   // degrades to no title candidates, but warns once per process so a
   // broken engine arm cannot ship dark.
-  const [keywordResults, titleResults]: [SearchResult[], SearchResult[]] =
+  //
+  // Third arm (opt-in, `search.trigram_arm`, off in every bundle): pg_trgm
+  // recall for surface forms the lexical arms structurally cannot reach —
+  // a Korean chunk that only ever writes a name with a particle attached
+  // ("인터엠디는") or fused into a compound ("카카오헬스케어") holds an FTS
+  // lexeme the base-form query token never equals, and the D2 AND→OR
+  // relaxation does not help because it relaxes at the same lexeme grain.
+  // Knob OFF resolves to `Promise.resolve([])`: no engine call, no SQL, and
+  // the fusion sites below all no-op on an empty list — a complete no-op.
+  // Fail-open WITH SIGNAL on the same contract as the title arm (a brain
+  // that predates the trigram index migration must degrade, not throw).
+  const trigramArmOn = resolvedMode.trigram_arm;
+  const [keywordResults, titleResults, trigramResults]: [SearchResult[], SearchResult[], SearchResult[]] =
     earlyModality === 'image'
-      ? [[], []]
+      ? [[], [], []]
       : await Promise.all([
           engine.searchKeyword(query, searchOpts),
           engine.searchTitles(query, searchOpts).catch((err: unknown) => {
@@ -1061,6 +1078,16 @@ export async function hybridSearch(
             );
             return [] as SearchResult[];
           }),
+          trigramArmOn
+            ? engine.searchTrigram(query, searchOpts).catch((err: unknown) => {
+                warnOncePerProcess(
+                  'search-trigram-arm-failed',
+                  `[gbrain] searchTrigram arm failed (fail-open, trigram candidates skipped): ` +
+                    `${err instanceof Error ? err.message : String(err)}`,
+                );
+                return [] as SearchResult[];
+              })
+            : Promise.resolve([] as SearchResult[]),
         ]);
 
   // v0.29.1: resolve salience/recency from caller (back-compat aliases for
@@ -1166,12 +1193,17 @@ export async function hybridSearch(
     // chunk-grain keyword FTS alone fails (D1).
     // issue #160: stamp unverified stubs BEFORE fusion so the compiled-truth
     // boost skips them (flag survives fusion's result spread).
-    await stampUnverifiedExtractions(engine, [...keywordResults, ...titleResults, ...relationalList]);
+    await stampUnverifiedExtractions(engine, [...keywordResults, ...titleResults, ...trigramResults, ...relationalList]);
     let noEmbedResults = keywordResults;
-    if (relationalList.length > 0 || titleResults.length > 0) {
+    // The trigram arm fuses here too. A keyless install is exactly where the
+    // surface-form gap bites hardest: with no vector arm, the lexeme-grain
+    // keyword/title arms are the ONLY way a particle-suffixed mention could
+    // be reached. Empty (arm off, or no qualifying token) → pure no-op.
+    if (relationalList.length > 0 || titleResults.length > 0 || trigramResults.length > 0) {
       const fk = opts?.rrfK ?? RRF_K;
       const noEmbedLists = [{ list: keywordResults, k: fk }];
       if (titleResults.length > 0) noEmbedLists.push({ list: titleResults, k: fk });
+      if (trigramResults.length > 0) noEmbedLists.push({ list: trigramResults, k: fk });
       if (relationalList.length > 0) noEmbedLists.push({ list: relationalList, k: fk });
       noEmbedResults = rrfFusionWeighted(noEmbedLists, detailResolved !== 'high');
     }
@@ -1410,12 +1442,16 @@ export async function hybridSearch(
     // here too (same rationale as the no-embedding-provider path — D1).
     // issue #160: stamp unverified stubs BEFORE fusion (see the
     // no-embedding-provider path for rationale).
-    await stampUnverifiedExtractions(engine, [...keywordResults, ...titleResults, ...relationalList]);
+    await stampUnverifiedExtractions(engine, [...keywordResults, ...titleResults, ...trigramResults, ...relationalList]);
     let fallbackResults = keywordResults;
-    if (relationalList.length > 0 || titleResults.length > 0) {
+    // Trigram arm fuses here too (same rationale as the no-embedding-provider
+    // path): when the embed call failed, the lexical arms are all that is
+    // left, and they are precisely the ones the surface-form gap defeats.
+    if (relationalList.length > 0 || titleResults.length > 0 || trigramResults.length > 0) {
       const fk = opts?.rrfK ?? RRF_K;
       const fallbackLists = [{ list: keywordResults, k: fk }];
       if (titleResults.length > 0) fallbackLists.push({ list: titleResults, k: fk });
+      if (trigramResults.length > 0) fallbackLists.push({ list: trigramResults, k: fk });
       if (relationalList.length > 0) fallbackLists.push({ list: relationalList, k: fk });
       fallbackResults = rrfFusionWeighted(fallbackLists, detail !== 'high');
     }
@@ -1489,6 +1525,15 @@ export async function hybridSearch(
   // check here. Empty for non-matching queries → pure no-op.
   if (titleResults.length > 0) {
     allLists.push({ list: titleResults, k: keywordK });
+  }
+
+  // Opt-in trigram arm as a further weighted list. Fuses at the keyword arm's
+  // intent-effective k — it is lexical evidence of the same class (a match on
+  // the chunk's own text), just at trigram grain instead of lexeme grain, so
+  // it introduces no new tunable. Fetch was already gated on earlyModality and
+  // on the knob, so no extra check here; empty list → pure no-op.
+  if (trigramResults.length > 0) {
+    allLists.push({ list: trigramResults, k: keywordK });
   }
 
   // v0.43 — relational recall arm (fourth RRF arm), built above so it also
@@ -1754,6 +1799,10 @@ export async function hybridSearchCached(
       // would be a no-op (both branches resolve to the same mode default).
       relationalRetrieval: opts?.relationalRetrieval,
       relational_retrieval_depth: opts?.relationalRetrievalDepth,
+      // Trigram arm threaded through the cache resolver too, so the knobsHash
+      // `tga=` bit reflects the per-call override. Without this, an arm-on
+      // call could be served an arm-off cache row, or vice versa.
+      trigram_arm: opts?.trigram_arm,
     },
   });
   // v0.36 (D8 / CDX-2 + codex /ship #4): resolve column for the cache

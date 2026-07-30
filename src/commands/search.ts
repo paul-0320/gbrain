@@ -46,6 +46,7 @@ const KNOB_DESCRIPTIONS: Record<keyof ModeBundle, string> = {
   cache_ttl_seconds: 'Per-row cache TTL',
   intentWeighting: 'Zero-LLM intent classifier weight adjustments',
   keywordOrFallback: 'Keyword-arm AND→OR zero-recall fallback',
+  trigram_arm: 'Opt-in pg_trgm recall arm (reaches particle/compound-only CJK surface forms; off by default)',
   tokenBudget: 'Per-call token-budget cap (undefined = no cap)',
   expansion: 'LLM multi-query expansion (Haiku call per search)',
   searchLimit: 'Default `limit` for the operation layer',

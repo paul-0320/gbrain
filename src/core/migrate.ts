@@ -5724,6 +5724,56 @@ export const MIGRATIONS: Migration[] = [
         ON take_proposals (source_id, page_slug, content_hash, prompt_version, md5(claim_text));
     `,
   },
+  {
+    version: 126,
+    name: 'chunks_text_trgm_index',
+    // GIN trigram index backing the opt-in trigram recall arm
+    // (`search.trigram_arm` → engine.searchTrigram). Without it the arm's
+    // `$n <% cc.chunk_text` predicate degrades to a sequential scan with a
+    // word_similarity() call per row — unusable on a 300K-chunk brain.
+    // gin_trgm_ops is the operator class that can answer `<%` (and `%`,
+    // `LIKE`, `~`) from the index; the arm deliberately uses the DEFAULT
+    // pg_trgm.word_similarity_threshold so the index stays usable.
+    //
+    // Partial on `modality = 'text'` to match the arm's own filter: image
+    // rows only carry OCR text, the arm excludes them, and skipping them
+    // keeps the index proportional to text-chunk count.
+    //
+    // Built even when the knob is off. The index is the expensive,
+    // long-running part of turning the arm on; making an operator run a
+    // separate manual DDL after flipping a config key is the kind of
+    // half-applied state that shows up later as "search got slow".
+    //
+    // Engine-aware via handler (mirrors v14 / v66): Postgres uses CREATE
+    // INDEX CONCURRENTLY to avoid the ShareLock a plain CREATE INDEX holds
+    // on content_chunks for the whole build, which would block sync/embed/
+    // autopilot writes. CONCURRENTLY refuses to run inside a transaction
+    // (hence `transaction: false`) and a failed build leaves an INVALID
+    // index that blocks every retry — dropInvalidConcurrentIndex clears that
+    // remnant first. PGLite is single-writer WASM with no concurrent-build
+    // concept, so it takes the plain form.
+    idempotent: true,
+    transaction: false,
+    sql: '',
+    handler: async (engine) => {
+      if (engine.kind === 'postgres') {
+        await dropInvalidConcurrentIndex(engine, 126, 'idx_chunks_text_trgm');
+        await engine.runMigration(
+          126,
+          `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_chunks_text_trgm
+             ON content_chunks USING GIN (chunk_text gin_trgm_ops)
+             WHERE modality = 'text';`
+        );
+      } else {
+        await engine.runMigration(
+          126,
+          `CREATE INDEX IF NOT EXISTS idx_chunks_text_trgm
+             ON content_chunks USING GIN (chunk_text gin_trgm_ops)
+             WHERE modality = 'text';`
+        );
+      }
+    },
+  },
 ];
 
 export const LATEST_VERSION = MIGRATIONS.length > 0

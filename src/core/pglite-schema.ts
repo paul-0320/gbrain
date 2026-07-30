@@ -259,6 +259,13 @@ CREATE INDEX IF NOT EXISTS idx_chunks_language ON content_chunks(language) WHERE
 -- and --priority recent. See src/schema.sql for full rationale.
 CREATE INDEX IF NOT EXISTS content_chunks_stale_idx
   ON content_chunks(page_id, chunk_index) WHERE embedding IS NULL;
+-- Trigram index backing the opt-in trigram recall arm (search.trigram_arm
+-- → engine.searchTrigram). See src/schema.sql for full rationale. PGLite has
+-- pg_trgm loaded at connect (extensions vector + pg_trgm); migration v126
+-- adds this index for upgrade paths (plain CREATE — no CONCURRENTLY here).
+CREATE INDEX IF NOT EXISTS idx_chunks_text_trgm
+  ON content_chunks USING GIN (chunk_text gin_trgm_ops)
+  WHERE modality = 'text';
 
 -- ============================================================
 -- links: cross-references between pages

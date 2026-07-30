@@ -345,6 +345,14 @@ CREATE INDEX IF NOT EXISTS idx_chunks_embedding_image
   WHERE embedding_image IS NOT NULL;
 -- v0.20.0 Cathedral II: GIN index on the new chunk-grain FTS vector.
 CREATE INDEX IF NOT EXISTS idx_chunks_search_vector ON content_chunks USING GIN(search_vector);
+-- Trigram index backing the opt-in trigram recall arm (\`search.trigram_arm\`
+-- → engine.searchTrigram). gin_trgm_ops is what makes \`\$n <% chunk_text\`
+-- index-answerable at the default word_similarity threshold. Partial on
+-- modality='text' to match the arm's own filter (image rows carry only OCR
+-- text and the arm excludes them). Migration v126 adds it for upgrade paths.
+CREATE INDEX IF NOT EXISTS idx_chunks_text_trgm
+  ON content_chunks USING GIN (chunk_text gin_trgm_ops)
+  WHERE modality = 'text';
 CREATE INDEX IF NOT EXISTS idx_chunks_symbol_qualified
   ON content_chunks(symbol_name_qualified) WHERE symbol_name_qualified IS NOT NULL;
 -- v0.41.18.0 (codex finding #9): partial index for \`gbrain embed --stale\`
