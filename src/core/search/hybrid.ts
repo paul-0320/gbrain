@@ -1095,7 +1095,11 @@ export async function hybridSearch(
     // is a recall arm — opt in to the engine's AND→OR zero-recall fallback.
     // Direct searchKeyword consumers (countMentions, link-extraction, eval)
     // do NOT set this and keep the strict-AND contract.
-    orFallback: true,
+    // Mode-resolved since v=19 (`search.keywordOrFallback`, fork-carry): corpora
+    // the FTS config can't stem (CJK under 'english') get OR floods that
+    // IDF-less ts_rank can't demote — operators there turn the fallback off.
+    // The bundle default stays true (previous hardcoded behavior).
+    orFallback: resolvedMode.keywordOrFallback,
     // v0.46.15: collect searchVector's bounded-escalation exhaustion signal —
     // engines have no telemetry sink (R2-10); hybrid owns the meta emit.
     // ACCUMULATES across vector calls (adversarial F8): expansion runs N
