@@ -58,7 +58,7 @@ import { finalizeLastSeen } from './chronicle/last-seen.ts';
 import { computeAnomaliesFromBuckets } from './cycle/anomaly.ts';
 import { resolveBoostMap, resolveHardExcludes } from './search/source-boost.ts';
 import { buildSourceFactorCase, buildHardExcludeClause, buildVisibilityClause, buildRecencyComponentSql, buildBestPerPagePoolCte, buildOrFallbackWebsearchQuery } from './search/sql-ranking.ts';
-import { extractTrigramTokens } from './search/trigram.ts';
+import { extractTrigramTokens, dropFloodTokens, buildTrigramDfLikePattern, parseTrigramDfRows, TRIGRAM_DF_PROBE_SQL } from './search/trigram.ts';
 import { unverifiedExtractionFragment } from './extraction-review.ts';
 import { shouldExcludeFromOrphanReporting, loadOrphanPolicyOverrides } from './orphan-policy.ts';
 import { LINK_EXTRACTOR_VERSION_TS } from './link-extraction.ts';
@@ -1715,6 +1715,16 @@ export class PGLiteEngine implements BrainEngine {
    * or compounded surface form defeats. The trigram predicate is the
    * fuzzy-match complement, not a replacement, and the ILIKE path stays
    * untouched.
+   *
+   * Corpus-frequency gate: before the main query, one DF probe measures how
+   * many text chunks contain each operand, and `dropFloodTokens` removes the
+   * corpus-common ones. Without it the arm's IDF-less sum-of-similarity hands
+   * a perfect score to every chunk containing a word like "자동" (23.9% of the
+   * production corpus) and floods the reranker's input window — measured as
+   * 57 → 45 answers found on a 62-question gate. Two plain statements here
+   * rather than Postgres's shared transaction: PGLite is a single-writer
+   * in-process engine, so this arm never needed the scoped-transaction
+   * wrapper that the probe would otherwise have to join.
    */
   async searchTrigram(query: string, opts?: SearchOpts): Promise<SearchResult[]> {
     // No qualifying token → contribute nothing, without a DB round-trip.
@@ -1732,87 +1742,105 @@ export class PGLiteEngine implements BrainEngine {
     const hardExcludeClause = buildHardExcludeClause('p.slug', hardExcludePrefixes);
     const visibilityClause = buildVisibilityClause('p', 's');
 
-    // $1..$N = trigram operands, then innerLimit / limit / offset, then the
-    // optional filter params. word_similarity is asymmetric — the query
-    // fragment is the LEFT operand of `<%`.
-    const params: unknown[] = [...tokens];
-    const tokenRefs = tokens.map((_, i) => `$${i + 1}`);
-    const trigramMatchClause = tokenRefs.map((ref) => `${ref} <% cc.chunk_text`).join(' OR ');
-    const trigramScoreExpr = tokenRefs
-      .map((ref) => `word_similarity(${ref}, cc.chunk_text)`)
-      .join(' + ');
-    params.push(innerLimit);
-    const innerLimitParam = `$${params.length}`;
-    params.push(limit);
-    const limitParam = `$${params.length}`;
-    params.push(offset);
-    const offsetParam = `$${params.length}`;
+    // Everything below is rebuilt from the SURVIVING operand list, because the
+    // token count sets every subsequent parameter index — the gate cannot be
+    // applied to an already-assembled param array.
+    const buildQuery = (survivors: string[]): { sql: string; params: unknown[] } => {
+      // $1..$N = trigram operands, then innerLimit / limit / offset, then the
+      // optional filter params. word_similarity is asymmetric — the query
+      // fragment is the LEFT operand of `<%`.
+      const params: unknown[] = [...survivors];
+      const tokenRefs = survivors.map((_, i) => `$${i + 1}`);
+      const trigramMatchClause = tokenRefs.map((ref) => `${ref} <% cc.chunk_text`).join(' OR ');
+      const trigramScoreExpr = tokenRefs
+        .map((ref) => `word_similarity(${ref}, cc.chunk_text)`)
+        .join(' + ');
+      params.push(innerLimit);
+      const innerLimitParam = `$${params.length}`;
+      params.push(limit);
+      const limitParam = `$${params.length}`;
+      params.push(offset);
+      const offsetParam = `$${params.length}`;
 
-    let extraFilter = '';
-    if (opts?.type) {
-      params.push(opts.type);
-      extraFilter += ` AND p.type = $${params.length}`;
-    }
-    if (opts?.types && opts.types.length > 0) {
-      params.push(opts.types);
-      extraFilter += ` AND p.type = ANY($${params.length}::text[])`;
-    }
-    if (opts?.exclude_slugs?.length) {
-      params.push(opts.exclude_slugs);
-      extraFilter += ` AND p.slug != ALL($${params.length}::text[])`;
-    }
-    if (opts?.language) {
-      params.push(opts.language);
-      extraFilter += ` AND cc.language = $${params.length}`;
-    }
-    if (opts?.symbolKind) {
-      params.push(opts.symbolKind);
-      extraFilter += ` AND cc.symbol_type = $${params.length}`;
-    }
-    if (opts?.afterDate) {
-      params.push(opts.afterDate);
-      extraFilter += ` AND COALESCE(p.effective_date, p.updated_at, p.created_at) > $${params.length}::timestamptz`;
-    }
-    if (opts?.beforeDate) {
-      params.push(opts.beforeDate);
-      extraFilter += ` AND COALESCE(p.effective_date, p.updated_at, p.created_at) < $${params.length}::timestamptz`;
-    }
-    if (opts?.sourceIds && opts.sourceIds.length > 0) {
-      params.push(opts.sourceIds);
-      extraFilter += ` AND p.source_id = ANY($${params.length}::text[])`;
-    } else if (opts?.sourceId) {
-      params.push(opts.sourceId);
-      extraFilter += ` AND p.source_id = $${params.length}`;
-    }
+      let extraFilter = '';
+      if (opts?.type) {
+        params.push(opts.type);
+        extraFilter += ` AND p.type = $${params.length}`;
+      }
+      if (opts?.types && opts.types.length > 0) {
+        params.push(opts.types);
+        extraFilter += ` AND p.type = ANY($${params.length}::text[])`;
+      }
+      if (opts?.exclude_slugs?.length) {
+        params.push(opts.exclude_slugs);
+        extraFilter += ` AND p.slug != ALL($${params.length}::text[])`;
+      }
+      if (opts?.language) {
+        params.push(opts.language);
+        extraFilter += ` AND cc.language = $${params.length}`;
+      }
+      if (opts?.symbolKind) {
+        params.push(opts.symbolKind);
+        extraFilter += ` AND cc.symbol_type = $${params.length}`;
+      }
+      if (opts?.afterDate) {
+        params.push(opts.afterDate);
+        extraFilter += ` AND COALESCE(p.effective_date, p.updated_at, p.created_at) > $${params.length}::timestamptz`;
+      }
+      if (opts?.beforeDate) {
+        params.push(opts.beforeDate);
+        extraFilter += ` AND COALESCE(p.effective_date, p.updated_at, p.created_at) < $${params.length}::timestamptz`;
+      }
+      if (opts?.sourceIds && opts.sourceIds.length > 0) {
+        params.push(opts.sourceIds);
+        extraFilter += ` AND p.source_id = ANY($${params.length}::text[])`;
+      } else if (opts?.sourceId) {
+        params.push(opts.sourceId);
+        extraFilter += ` AND p.source_id = $${params.length}`;
+      }
 
-    const trigramSql =
-      `WITH ranked AS (
-         SELECT
-           p.slug, p.id as page_id, p.title, p.type, p.source_id,
-           p.effective_date, p.effective_date_source,
-           CASE WHEN NULLIF(regexp_replace(p.frontmatter->>'message_id', '^[[:space:]]+|[[:space:]]+$', '', 'g'), '') IS NOT NULL
-             THEN p.frontmatter->>'message_id' END AS message_id, p.frontmatter->>'thread_id' AS thread_id,
-           CASE WHEN NULLIF(regexp_replace(p.frontmatter->>'message_id', '^[[:space:]]+|[[:space:]]+$', '', 'g'), '') IS NOT NULL
-             THEN NULLIF(p.frontmatter->>'subject', '') END AS source_subject,
-           cc.id as chunk_id, cc.chunk_index, cc.chunk_text, cc.chunk_source,
-           (${trigramScoreExpr}) * ${sourceFactorCase} AS score,
-           CASE WHEN p.updated_at < (
-             SELECT MAX(te.created_at) FROM timeline_entries te WHERE te.page_id = p.id
-           ) THEN true ELSE false END AS stale
-         FROM content_chunks cc
-         JOIN pages p ON p.id = cc.page_id
-         JOIN sources s ON s.id = p.source_id
-         WHERE (${trigramMatchClause}) ${detailFilter}${extraFilter} ${hardExcludeClause} ${visibilityClause}
-           AND cc.modality = 'text'
-         ORDER BY score DESC
-         LIMIT ${innerLimitParam}
-       ),
-       ${buildBestPerPagePoolCte('ranked')}
-       SELECT * FROM best_per_page
-       ORDER BY score DESC, page_id ASC, chunk_id ASC
-       LIMIT ${limitParam} OFFSET ${offsetParam}`;
+      const trigramSql =
+        `WITH ranked AS (
+           SELECT
+             p.slug, p.id as page_id, p.title, p.type, p.source_id,
+             p.effective_date, p.effective_date_source,
+             CASE WHEN NULLIF(regexp_replace(p.frontmatter->>'message_id', '^[[:space:]]+|[[:space:]]+$', '', 'g'), '') IS NOT NULL
+               THEN p.frontmatter->>'message_id' END AS message_id, p.frontmatter->>'thread_id' AS thread_id,
+             CASE WHEN NULLIF(regexp_replace(p.frontmatter->>'message_id', '^[[:space:]]+|[[:space:]]+$', '', 'g'), '') IS NOT NULL
+               THEN NULLIF(p.frontmatter->>'subject', '') END AS source_subject,
+             cc.id as chunk_id, cc.chunk_index, cc.chunk_text, cc.chunk_source,
+             (${trigramScoreExpr}) * ${sourceFactorCase} AS score,
+             CASE WHEN p.updated_at < (
+               SELECT MAX(te.created_at) FROM timeline_entries te WHERE te.page_id = p.id
+             ) THEN true ELSE false END AS stale
+           FROM content_chunks cc
+           JOIN pages p ON p.id = cc.page_id
+           JOIN sources s ON s.id = p.source_id
+           WHERE (${trigramMatchClause}) ${detailFilter}${extraFilter} ${hardExcludeClause} ${visibilityClause}
+             AND cc.modality = 'text'
+           ORDER BY score DESC
+           LIMIT ${innerLimitParam}
+         ),
+         ${buildBestPerPagePoolCte('ranked')}
+         SELECT * FROM best_per_page
+         ORDER BY score DESC, page_id ASC, chunk_id ASC
+         LIMIT ${limitParam} OFFSET ${offsetParam}`;
+      return { sql: trigramSql, params };
+    };
 
-    const { rows } = await this.db.query(trigramSql, params);
+    // Corpus-frequency gate. One probe for corpus size + per-operand DF, then
+    // drop the flood terms. Zero survivors is a normal outcome (an all-common
+    // query) — skip the main query rather than emit a disjunct-less WHERE.
+    const { rows: dfRows } = await this.db.query(
+      TRIGRAM_DF_PROBE_SQL,
+      [tokens, tokens.map(buildTrigramDfLikePattern)],
+    );
+    const { totalTextChunks, counts } = parseTrigramDfRows(dfRows as Record<string, unknown>[]);
+    const survivors = dropFloodTokens(tokens, counts, totalTextChunks);
+    if (survivors.length === 0) return [];
+
+    const { sql, params } = buildQuery(survivors);
+    const { rows } = await this.db.query(sql, params);
     return (rows as Record<string, unknown>[]).map(rowToSearchResult);
   }
 

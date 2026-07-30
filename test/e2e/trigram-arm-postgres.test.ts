@@ -96,4 +96,33 @@ describePG('searchTrigram — Postgres engine arm', () => {
     expect((await engine.searchTrigram('인터엠디 미팅', { type: 'note' })).length).toBeGreaterThan(0);
     expect(await engine.searchTrigram('인터엠디 미팅', { type: 'person' })).toEqual([]);
   });
+
+  // Corpus-frequency gate — the Postgres half. The probe rides inside the same
+  // scoped read transaction as the main query, so this also covers the
+  // real-pg_trgm/postgres.js path for `unnest($1::text[], $2::text[])` and the
+  // ESCAPE clause, neither of which the PGLite mirror can prove.
+  test('flood operands are gated away on Postgres too', async () => {
+    const engine = getEngine();
+    await engine.putPage('notes/bulk-log', {
+      type: 'note',
+      title: 'Bulk Batch Log',
+      compiled_truth: '배치 작업 로그 모음',
+    });
+    await engine.upsertChunks(
+      'notes/bulk-log',
+      Array.from({ length: 60 }, (_, i) => ({
+        chunk_index: i,
+        chunk_text: `${i}번째 배치에서 자동 실행 작업이 정상 종료되었다.`,
+        chunk_source: (i === 0 ? 'compiled_truth' : 'timeline') as 'compiled_truth' | 'timeline',
+      })),
+    );
+
+    // 61 text chunks → threshold = max(50, 1.83) = 50; 자동/실행 occur in 60.
+    expect(await engine.searchTrigram('자동 실행')).toEqual([]);
+
+    // The rare operand still survives and reaches its page.
+    const mixed = await engine.searchTrigram('자동 인터엠디');
+    expect(mixed.map((r) => r.slug)).toContain('notes/vendor-log');
+    expect(mixed.map((r) => r.slug)).not.toContain('notes/bulk-log');
+  });
 });

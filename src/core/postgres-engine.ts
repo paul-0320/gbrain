@@ -65,7 +65,7 @@ import { logConnectionEvent } from './connection-audit.ts';
 import { validateSlug, contentHash, rowToPage, rowToStalePage, rowToChunk, rowToSearchResult, parseEmbedding, tryParseEmbedding, takeRowToTake, takeHitRowToHit, isUndefinedTableError, warnOncePerProcess } from './utils.ts';
 import { resolveBoostMap, resolveHardExcludes } from './search/source-boost.ts';
 import { buildSourceFactorCase, buildHardExcludeClause, buildVisibilityClause, buildRecencyComponentSql, buildBestPerPagePoolCte, buildOrFallbackWebsearchQuery } from './search/sql-ranking.ts';
-import { extractTrigramTokens } from './search/trigram.ts';
+import { extractTrigramTokens, dropFloodTokens, buildTrigramDfLikePattern, parseTrigramDfRows, TRIGRAM_DF_PROBE_SQL } from './search/trigram.ts';
 import { unverifiedExtractionFragment } from './extraction-review.ts';
 import { DEFAULT_EMBEDDING_MODEL, DEFAULT_EMBEDDING_DIMENSIONS } from './ai/defaults.ts';
 import { DELETE_BATCH_SIZE } from './engine-constants.ts';
@@ -1852,6 +1852,15 @@ export class PostgresEngine implements BrainEngine {
    *
    * No AND→OR-style relaxation: the predicate is already a disjunction, so
    * there is nothing to relax — zero rows means zero rows.
+   *
+   * Corpus-frequency gate: before the main query, one DF probe measures how
+   * many text chunks contain each operand, and `dropFloodTokens` removes the
+   * corpus-common ones. Without it the arm's IDF-less sum-of-similarity hands
+   * a perfect score to every chunk containing a word like "자동" (23.9% of the
+   * production corpus) and floods the reranker's input window — measured as
+   * 57 → 45 answers found on a 62-question gate. Probe and main query share
+   * ONE transaction, so the gate costs no extra connection round trip and
+   * inherits the same 8s timeout.
    */
   async searchTrigram(query: string, opts?: SearchOpts): Promise<SearchResult[]> {
     // No qualifying token → the arm contributes nothing. Return BEFORE any
@@ -1877,118 +1886,136 @@ export class PostgresEngine implements BrainEngine {
     const hardExcludeClause = buildHardExcludeClause('p.slug', hardExcludePrefixes);
     const visibilityClause = buildVisibilityClause('p', 's');
 
-    // Token operands occupy $1..$N. `$n <% cc.chunk_text` — operand order
-    // matters: word_similarity is asymmetric (it slides the LEFT argument
-    // over the RIGHT one), so the query fragment must be on the left.
-    const params: unknown[] = [...tokens];
-    const tokenRefs = tokens.map((_, i) => `$${i + 1}`);
-    const trigramMatchClause = tokenRefs.map((ref) => `${ref} <% cc.chunk_text`).join(' OR ');
-    const trigramScoreExpr = tokenRefs
-      .map((ref) => `word_similarity(${ref}, cc.chunk_text)`)
-      .join(' + ');
+    // Everything below is rebuilt from the SURVIVING operand list, because the
+    // token count sets every subsequent parameter index — the gate cannot be
+    // applied to an already-assembled param array.
+    const buildQuery = (survivors: string[]): { sql: string; params: unknown[] } => {
+      // Token operands occupy $1..$N. `$n <% cc.chunk_text` — operand order
+      // matters: word_similarity is asymmetric (it slides the LEFT argument
+      // over the RIGHT one), so the query fragment must be on the left.
+      const params: unknown[] = [...survivors];
+      const tokenRefs = survivors.map((_, i) => `$${i + 1}`);
+      const trigramMatchClause = tokenRefs.map((ref) => `${ref} <% cc.chunk_text`).join(' OR ');
+      const trigramScoreExpr = tokenRefs
+        .map((ref) => `word_similarity(${ref}, cc.chunk_text)`)
+        .join(' + ');
 
-    let typeClause = '';
-    if (type) {
-      params.push(type);
-      typeClause = `AND p.type = $${params.length}`;
-    }
-    let typesClause = '';
-    if (opts?.types && opts.types.length > 0) {
-      params.push(opts.types);
-      typesClause = `AND p.type = ANY($${params.length}::text[])`;
-    }
-    let excludeSlugsClause = '';
-    if (excludeSlugs?.length) {
-      params.push(excludeSlugs);
-      excludeSlugsClause = `AND p.slug != ALL($${params.length}::text[])`;
-    }
-    // language/symbolKind are chunk-grain filters this arm CAN honor (unlike
-    // the page-grain title arm, which bails). Applied so a code-scoped caller
-    // never receives rows that violate its filter.
-    let languageClause = '';
-    if (language) {
-      params.push(language);
-      languageClause = `AND cc.language = $${params.length}`;
-    }
-    let symbolKindClause = '';
-    if (symbolKind) {
-      params.push(symbolKind);
-      symbolKindClause = `AND cc.symbol_type = $${params.length}`;
-    }
-    let afterDateClause = '';
-    if (opts?.afterDate) {
-      params.push(opts.afterDate);
-      afterDateClause = `AND COALESCE(p.effective_date, p.updated_at, p.created_at) > $${params.length}::timestamptz`;
-    }
-    let beforeDateClause = '';
-    if (opts?.beforeDate) {
-      params.push(opts.beforeDate);
-      beforeDateClause = `AND COALESCE(p.effective_date, p.updated_at, p.created_at) < $${params.length}::timestamptz`;
-    }
-    // Source-isolation filter (#861 P0 leak seal). Array form wins over
-    // scalar, pushed into the inner CTE exactly as searchKeyword does.
-    let sourceClause = '';
-    if (opts?.sourceIds && opts.sourceIds.length > 0) {
-      params.push(opts.sourceIds);
-      sourceClause = `AND p.source_id = ANY($${params.length}::text[])`;
-    } else if (opts?.sourceId) {
-      params.push(opts.sourceId);
-      sourceClause = `AND p.source_id = $${params.length}`;
-    }
-    params.push(innerLimit);
-    const innerLimitParam = `$${params.length}`;
-    params.push(limit);
-    const limitParam = `$${params.length}`;
-    params.push(offset);
-    const offsetParam = `$${params.length}`;
+      let typeClause = '';
+      if (type) {
+        params.push(type);
+        typeClause = `AND p.type = $${params.length}`;
+      }
+      let typesClause = '';
+      if (opts?.types && opts.types.length > 0) {
+        params.push(opts.types);
+        typesClause = `AND p.type = ANY($${params.length}::text[])`;
+      }
+      let excludeSlugsClause = '';
+      if (excludeSlugs?.length) {
+        params.push(excludeSlugs);
+        excludeSlugsClause = `AND p.slug != ALL($${params.length}::text[])`;
+      }
+      // language/symbolKind are chunk-grain filters this arm CAN honor (unlike
+      // the page-grain title arm, which bails). Applied so a code-scoped caller
+      // never receives rows that violate its filter.
+      let languageClause = '';
+      if (language) {
+        params.push(language);
+        languageClause = `AND cc.language = $${params.length}`;
+      }
+      let symbolKindClause = '';
+      if (symbolKind) {
+        params.push(symbolKind);
+        symbolKindClause = `AND cc.symbol_type = $${params.length}`;
+      }
+      let afterDateClause = '';
+      if (opts?.afterDate) {
+        params.push(opts.afterDate);
+        afterDateClause = `AND COALESCE(p.effective_date, p.updated_at, p.created_at) > $${params.length}::timestamptz`;
+      }
+      let beforeDateClause = '';
+      if (opts?.beforeDate) {
+        params.push(opts.beforeDate);
+        beforeDateClause = `AND COALESCE(p.effective_date, p.updated_at, p.created_at) < $${params.length}::timestamptz`;
+      }
+      // Source-isolation filter (#861 P0 leak seal). Array form wins over
+      // scalar, pushed into the inner CTE exactly as searchKeyword does.
+      let sourceClause = '';
+      if (opts?.sourceIds && opts.sourceIds.length > 0) {
+        params.push(opts.sourceIds);
+        sourceClause = `AND p.source_id = ANY($${params.length}::text[])`;
+      } else if (opts?.sourceId) {
+        params.push(opts.sourceId);
+        sourceClause = `AND p.source_id = $${params.length}`;
+      }
+      params.push(innerLimit);
+      const innerLimitParam = `$${params.length}`;
+      params.push(limit);
+      const limitParam = `$${params.length}`;
+      params.push(offset);
+      const offsetParam = `$${params.length}`;
 
-    const rawQuery = `
-      WITH ranked_chunks AS (
-        SELECT
-          p.slug, p.id as page_id, p.title, p.type, p.source_id,
-          p.effective_date, p.effective_date_source,
-          CASE WHEN NULLIF(regexp_replace(p.frontmatter->>'message_id', '^[[:space:]]+|[[:space:]]+$', '', 'g'), '') IS NOT NULL
-            THEN p.frontmatter->>'message_id' END AS message_id, p.frontmatter->>'thread_id' AS thread_id,
-          CASE WHEN NULLIF(regexp_replace(p.frontmatter->>'message_id', '^[[:space:]]+|[[:space:]]+$', '', 'g'), '') IS NOT NULL
-            THEN NULLIF(p.frontmatter->>'subject', '') END AS source_subject,
-          cc.id as chunk_id, cc.chunk_index, cc.chunk_text, cc.chunk_source,
-          (${trigramScoreExpr}) * ${sourceFactorCase} AS score
-        FROM content_chunks cc
-        JOIN pages p ON p.id = cc.page_id
-        JOIN sources s ON s.id = p.source_id
-        WHERE (${trigramMatchClause})
-          ${typeClause}
-          ${typesClause}
-          ${excludeSlugsClause}
-          ${detailLow ? `AND cc.chunk_source = 'compiled_truth'` : ''}
-          ${languageClause}
-          ${symbolKindClause}
-          ${afterDateClause}
-          ${beforeDateClause}
-          ${sourceClause}
-          ${hardExcludeClause}
-          ${visibilityClause}
-          -- Mirrors searchKeyword: image rows carry OCR text that would
-          -- otherwise drown text-page hits in a text-grain arm.
-          AND cc.modality = 'text'
+      const rawQuery = `
+        WITH ranked_chunks AS (
+          SELECT
+            p.slug, p.id as page_id, p.title, p.type, p.source_id,
+            p.effective_date, p.effective_date_source,
+            CASE WHEN NULLIF(regexp_replace(p.frontmatter->>'message_id', '^[[:space:]]+|[[:space:]]+$', '', 'g'), '') IS NOT NULL
+              THEN p.frontmatter->>'message_id' END AS message_id, p.frontmatter->>'thread_id' AS thread_id,
+            CASE WHEN NULLIF(regexp_replace(p.frontmatter->>'message_id', '^[[:space:]]+|[[:space:]]+$', '', 'g'), '') IS NOT NULL
+              THEN NULLIF(p.frontmatter->>'subject', '') END AS source_subject,
+            cc.id as chunk_id, cc.chunk_index, cc.chunk_text, cc.chunk_source,
+            (${trigramScoreExpr}) * ${sourceFactorCase} AS score
+          FROM content_chunks cc
+          JOIN pages p ON p.id = cc.page_id
+          JOIN sources s ON s.id = p.source_id
+          WHERE (${trigramMatchClause})
+            ${typeClause}
+            ${typesClause}
+            ${excludeSlugsClause}
+            ${detailLow ? `AND cc.chunk_source = 'compiled_truth'` : ''}
+            ${languageClause}
+            ${symbolKindClause}
+            ${afterDateClause}
+            ${beforeDateClause}
+            ${sourceClause}
+            ${hardExcludeClause}
+            ${visibilityClause}
+            -- Mirrors searchKeyword: image rows carry OCR text that would
+            -- otherwise drown text-page hits in a text-grain arm.
+            AND cc.modality = 'text'
+          ORDER BY score DESC
+          LIMIT ${innerLimitParam}
+        ),
+        ${buildBestPerPagePoolCte('ranked_chunks')}
+        SELECT slug, page_id, title, type, source_id,
+          effective_date, effective_date_source,
+          message_id, thread_id, source_subject,
+          chunk_id, chunk_index, chunk_text, chunk_source, score,
+          false AS stale
+        FROM best_per_page
         ORDER BY score DESC
-        LIMIT ${innerLimitParam}
-      ),
-      ${buildBestPerPagePoolCte('ranked_chunks')}
-      SELECT slug, page_id, title, type, source_id,
-        effective_date, effective_date_source,
-        message_id, thread_id, source_subject,
-        chunk_id, chunk_index, chunk_text, chunk_source, score,
-        false AS stale
-      FROM best_per_page
-      ORDER BY score DESC
-      LIMIT ${limitParam}
-      OFFSET ${offsetParam}
-    `;
+        LIMIT ${limitParam}
+        OFFSET ${offsetParam}
+      `;
+      return { sql: rawQuery, params };
+    };
 
     const rows = await this.withScopedReadTransaction(opts?.sourceIds, opts?.sourceId, async (tx) => {
       await tx`SET LOCAL statement_timeout = '8s'`;
-      return await tx.unsafe(rawQuery, params as Parameters<typeof tx.unsafe>[1]);
+      // Corpus-frequency gate. One probe for corpus size + per-operand DF,
+      // then drop the flood terms. Zero survivors is a normal outcome (an
+      // all-common query) — skip the main query rather than emit a
+      // disjunct-less WHERE.
+      const dfRows = await tx.unsafe(
+        TRIGRAM_DF_PROBE_SQL,
+        [tokens, tokens.map(buildTrigramDfLikePattern)] as Parameters<typeof tx.unsafe>[1],
+      );
+      const { totalTextChunks, counts } = parseTrigramDfRows(dfRows as unknown as Record<string, unknown>[]);
+      const survivors = dropFloodTokens(tokens, counts, totalTextChunks);
+      if (survivors.length === 0) return [];
+      const { sql, params } = buildQuery(survivors);
+      return await tx.unsafe(sql, params as Parameters<typeof tx.unsafe>[1]);
     }, { alwaysTransaction: true });
     return rows.map(rowToSearchResult);
   }
