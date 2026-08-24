@@ -24,7 +24,7 @@ import type {
 import { affectsRecall } from '../types.ts';
 import { hasReadPolicy, pageReadFilter } from './read-policy-sql.ts';
 import { requiresSafeChunks } from './safe-chunks.ts';
-import { embed, embedQuery } from '../embedding.ts';
+import { embed, embedQuery, effectiveQueryInstruct } from '../embedding.ts';
 import { registerBackgroundWorkDrainer } from '../background-work.ts';
 import { isDbAccessFailure } from '../pg-access-classify.ts';
 import { resolveEmbeddingColumn, isCacheSafe } from './embedding-column.ts';
@@ -2688,6 +2688,7 @@ export async function hybridSearchCached(
       minKeep: adaptiveResolvedForCache.minKeep,
       intent: cacheSuggestions.intent,
     },
+    queryInstruct: effectiveQueryInstruct(resolvedColCached.embeddingModel), // v=30 qi= (see KnobsHashContext)
   });
 
   // Cache decision: opts.useCache (explicit) wins over global config; global

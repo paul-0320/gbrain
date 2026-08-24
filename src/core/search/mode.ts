@@ -1118,7 +1118,14 @@ export function attributeKnob<K extends keyof ModeBundle>(
 // identical other knobs, so a `lexical` write must never serve an `always`
 // lookup (and vice versa). A partial-knobs literal hashes as `mbg=always`;
 // appended after `kacf=`, same unshipped epoch — no extra bump.
-export const KNOBS_HASH_VERSION = 29;
+//
+// bump 29→30 (fork carry, upstream #3584 — permanent carry as of 2026-09-08):
+// qwen3-embedding query-side Instruct template — query vectors differ from
+// pre-template builds, and the effective sentence folds in via
+// ctx.queryInstruct (`qi=`) so processes with different GBRAIN_QUERY_INSTRUCT
+// values never cross-serve. Authored as 24→25; renumbered past upstream
+// kof=/wave-g/ar=/#4256/ranker-wave per the D8 convention.
+export const KNOBS_HASH_VERSION = 30;
 
 /**
  * v0.36 (D8 / CDX-2) — second-arg context for the cache key. The
@@ -1214,6 +1221,12 @@ export interface KnobsHashContext {
    * brain's rows under another brain's patterns in a multi-engine process.
    */
   intentPatterns?: string;
+  /**
+   * v=27 (fork carry): the effective query-side instruction sentence
+   * (gateway.effectiveQueryInstruct) — rows written under different
+   * instructions sit in different query-vector spaces. 'none' fallback.
+   */
+  queryInstruct?: string;
 }
 
 export function knobsHash(
@@ -1397,6 +1410,9 @@ export function knobsHash(
     // re-orders the fused page, so a `lexical` write must never serve an
     // `always` lookup. A partial-knobs literal hashes as `always` — the deliberate pre-wave hash identity, NOT the bundle default (`lexical`).
     `mbg=${knobs.metadata_boost_gate ?? DEFAULT_METADATA_BOOST_GATE}`,
+    // v=30 (append-only, fork carry): query-side instruct template —
+    // changes embedQuery() output; same class as input_type (v=11).
+    `qi=${ctx?.queryInstruct ?? 'none'}`,
   ];
   const h = createHash('sha256');
   h.update(parts.join('|'));
