@@ -949,7 +949,13 @@ export function attributeKnob<K extends keyof ModeBundle>(
 // within cache.ttl_seconds (3600s default). (Authored as 23→24 on the
 // wave-g branch; 24 and 25 were claimed by the two bumps above while it
 // was in flight, so it takes the next free number per the D8 convention.)
-export const KNOBS_HASH_VERSION = 26;
+//
+// bump 26→27 (fork carry, PR #3584): qwen3-embedding query-side Instruct
+// template — query vectors differ from pre-template builds, and the
+// effective sentence folds in via ctx.queryInstruct (`qi=`) so processes
+// with different GBRAIN_QUERY_INSTRUCT values never cross-serve. Authored
+// as 24→25; renumbered past upstream kof=/wave-g per the D8 convention.
+export const KNOBS_HASH_VERSION = 27;
 
 /**
  * v0.36 (D8 / CDX-2) — second-arg context for the cache key. The
@@ -1031,6 +1037,12 @@ export interface KnobsHashContext {
    * brain's rows under another brain's patterns in a multi-engine process.
    */
   intentPatterns?: string;
+  /**
+   * v=27 (fork carry): the effective query-side instruction sentence
+   * (gateway.effectiveQueryInstruct) — rows written under different
+   * instructions sit in different query-vector spaces. 'none' fallback.
+   */
+  queryInstruct?: string;
 }
 
 export function knobsHash(
@@ -1173,6 +1185,9 @@ export function knobsHash(
     `sal=${ctx?.salience ?? 'off'}`,
     `rec=${ctx?.recency ?? 'off'}`,
     `ipat=${ctx?.intentPatterns ?? 'none'}`,
+    // v=27 (append-only, fork carry): query-side instruct template —
+    // changes embedQuery() output; same class as input_type (v=11).
+    `qi=${ctx?.queryInstruct ?? 'none'}`,
   ];
   const h = createHash('sha256');
   h.update(parts.join('|'));
