@@ -446,7 +446,8 @@ describe('knobsHash determinism + cross-mode separation (CDX-4)', () => {
     // their default). A private-included write must not serve a
     // private-excluding lookup and vice versa.
     // 23→24: kof= (keyword AND→OR fallback knob) joins the key.
-    expect(KNOBS_HASH_VERSION).toBe(24);
+    // 24→25: qi= (query-side instruct template) joins the key.
+    expect(KNOBS_HASH_VERSION).toBe(25);
   });
 
   test('#3515: detail set vs unset produces DIFFERENT hashes (cache contamination prevention)', () => {
@@ -469,7 +470,8 @@ describe('knobsHash determinism + cross-mode separation (CDX-4)', () => {
     // mw2: 21→22 result-stamp/injection epoch (#1663 #3995 #3783 #4220).
     // #4352 follow-up: 22→23 private-visibility posture fold (xp=).
     // 23→24: kof= (keyword AND→OR fallback knob) joins the key.
-    expect(KNOBS_HASH_VERSION).toBe(24);
+    // 24→25: qi= (query-side instruct template) joins the key.
+    expect(KNOBS_HASH_VERSION).toBe(25);
   });
 
   test('#4352 follow-up: excludePrivate true vs false produces DIFFERENT hashes (cache contamination prevention)', () => {
@@ -651,9 +653,10 @@ describe('v0.40.4 — graph_signals knob', () => {
 });
 
 describe('v0.42.3.0 — autocut knobs', () => {
-  test('KNOBS_HASH_VERSION is 24 (22→23 excludePrivate posture fold #4352; 23→24 keywordOrFallback knob kof=)', () => {
+  test('KNOBS_HASH_VERSION is 25 (22→23 excludePrivate posture fold #4352; 23→24 keywordOrFallback knob kof=; 24→25 query-instruct qi=)', () => {
     // 23→24: kof= (keyword AND→OR fallback knob) joins the key.
-    expect(KNOBS_HASH_VERSION).toBe(24);
+    // 24→25: qi= (query-side instruct template) joins the key.
+    expect(KNOBS_HASH_VERSION).toBe(25);
   });
 
   test('bundle defaults: conservative off, balanced/tokenmax on @0.20', () => {

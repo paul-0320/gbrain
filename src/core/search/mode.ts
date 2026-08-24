@@ -918,7 +918,18 @@ export function attributeKnob<K extends keyof ModeBundle>(
 // through 23 (xp=) were claimed upstream while this PR was open, so it takes
 // the next free number. Same one-time global cold-miss pattern as the bumps
 // above.
-export const KNOBS_HASH_VERSION = 24;
+//
+// bump 24→25: qwen3-embedding query-side Instruct template. The gateway now
+// prepends the model card's instruction template to QUERY-side embeds for
+// qwen3-embedding models, so embedQuery() produces different vectors than
+// pre-template builds — pre-template rows (key embedding AND result set)
+// must not be served to post-template lookups. Same one-time global
+// cold-miss pattern as bump 10→11 (the input_type fix — the same class of
+// change). The effective sentence also folds into the key via
+// ctx.queryInstruct (append-only `qi=` part) so processes running different
+// GBRAIN_QUERY_INSTRUCT values never cross-serve (same per-process
+// contamination class as #2825's hardExcludes).
+export const KNOBS_HASH_VERSION = 25;
 
 /**
  * v0.36 (D8 / CDX-2) — second-arg context for the cache key. The
@@ -978,6 +989,17 @@ export interface KnobsHashContext {
    * (private included), matching enforcement's strict `=== true` semantics.
    */
   excludePrivate?: boolean;
+  /**
+   * v=25: the effective query-side instruction sentence the gateway
+   * prepends for the resolved embedding model
+   * (gateway.effectiveQueryInstruct) — undefined when the model takes no
+   * text template or it is disabled. Folded so a row written under one
+   * instruction (default, custom GBRAIN_QUERY_INSTRUCT, or disabled) is
+   * never served to a lookup under another — they sit in different
+   * query-vector spaces. Undefined falls back to the literal 'none' for
+   * legacy callers.
+   */
+  queryInstruct?: string;
 }
 
 export function knobsHash(
@@ -1111,6 +1133,11 @@ export function knobsHash(
     // disjoint (relaxed rows vs empty keyword arm). `?? true` mirrors the
     // module's defensive read of other knobs for partial-knobs callers.
     `kof=${(knobs.keywordOrFallback ?? true) ? 1 : 0}`,
+    // v=25 addition (append-only): query-side instruction template. The
+    // instruction changes what embedQuery() produces for qwen3-embedding
+    // models — the same contamination class as the input_type fix (v=11)
+    // and hardExcludes (v=12).
+    `qi=${ctx?.queryInstruct ?? 'none'}`,
   ];
   const h = createHash('sha256');
   h.update(parts.join('|'));

@@ -136,7 +136,7 @@ describe('D2 — knobsHash differs across cross-modal knob values', () => {
     return resolveSearchMode({ mode: 'balanced' });
   }
 
-  test('KNOBS_HASH_VERSION is 24 (cross-modal still appended; 21→22 result-stamp/injection epoch; 22→23 excludePrivate posture fold #4352; 23→24 keywordOrFallback knob kof=)', () => {
+  test('KNOBS_HASH_VERSION is 25 (cross-modal still appended; 21→22 result-stamp/injection epoch; 22→23 excludePrivate posture fold #4352; 23→24 keywordOrFallback knob kof=; 24→25 query-instruct qi=)', () => {
     // v0.35 ladder: 1→2 reranker, 2→3 floor_ratio. v0.36 piggybacks on v=3
     // with 7 cross-modal knobs + column/provider context. v0.40.4 (salem) +
     // v0.39 T21 (master) bump to v=4 for graph_signals + schema-pack fields.
@@ -162,7 +162,8 @@ describe('D2 — knobsHash differs across cross-modal knob values', () => {
     // 22→23 (#4352 follow-up): private-visibility posture fold (xp=) —
     // replaces the wholesale cache skip for excludePrivate=true callers.
     // 23→24: kof= (keyword AND→OR fallback knob) joins the key.
-    expect(KNOBS_HASH_VERSION).toBe(24);
+    // 24→25: qi= (query-side instruct template) joins the key.
+    expect(KNOBS_HASH_VERSION).toBe(25);
   });
 
   test('flipping unified_multimodal changes the hash', () => {
