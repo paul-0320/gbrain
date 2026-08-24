@@ -964,7 +964,12 @@ export function attributeKnob<K extends keyof ModeBundle>(
 // part; version-only invalidation (same class as the 13→14 detail=medium
 // boost-scope bump and the 21→22 stamp/injection epoch). One-time global
 // cold-miss spike on upgrade; refills within cache.ttl_seconds (3600s).
-export const KNOBS_HASH_VERSION = 28;
+// bump 28→29 (fork carry, PR #3584): qwen3-embedding query-side Instruct
+// template — query vectors differ from pre-template builds, and the
+// effective sentence folds in via ctx.queryInstruct (`qi=`) so processes
+// with different GBRAIN_QUERY_INSTRUCT values never cross-serve. Authored
+// as 24→25; renumbered past upstream kof=/wave-g/ar=/#4256 per the D8 convention.
+export const KNOBS_HASH_VERSION = 29;
 
 /**
  * v0.36 (D8 / CDX-2) — second-arg context for the cache key. The
@@ -1060,6 +1065,12 @@ export interface KnobsHashContext {
    * brain's rows under another brain's patterns in a multi-engine process.
    */
   intentPatterns?: string;
+  /**
+   * v=27 (fork carry): the effective query-side instruction sentence
+   * (gateway.effectiveQueryInstruct) — rows written under different
+   * instructions sit in different query-vector spaces. 'none' fallback.
+   */
+  queryInstruct?: string;
 }
 
 export function knobsHash(
@@ -1223,6 +1234,9 @@ export function knobsHash(
     `arom=${ctx?.adaptiveReturn?.enabled ? ctx.adaptiveReturn.otherMax : 'none'}`,
     `armk=${ctx?.adaptiveReturn?.enabled ? ctx.adaptiveReturn.minKeep : 'none'}`,
     `ari=${ctx?.adaptiveReturn?.enabled ? ctx.adaptiveReturn.intent : 'none'}`,
+    // v=29 (append-only, fork carry): query-side instruct template —
+    // changes embedQuery() output; same class as input_type (v=11).
+    `qi=${ctx?.queryInstruct ?? 'none'}`,
   ];
   const h = createHash('sha256');
   h.update(parts.join('|'));
