@@ -300,8 +300,13 @@ const codeReadOperations: Operation[] = [
 
 // Raw code fragments and cached traversals do not yet support the complete
 // remote read policy. Suspend this optional surface before touching storage.
+// Fork carry (ymyd patch ⑲): GBRAIN_REMOTE_CODE_READS=1 re-opens the surface to
+// remote callers. Only for brains whose code sources are readable by every
+// client (company code, no per-room secrets). Default stays upstream (suspended).
+const remoteCodeReadsEnabled = process.env.GBRAIN_REMOTE_CODE_READS === '1';
+
 export const codeIntelOperations: Operation[] = [
-  ...codeReadOperations.map((op): Operation => ({
+  ...(remoteCodeReadsEnabled ? codeReadOperations : codeReadOperations.map((op): Operation => ({
     ...op,
     description: `${op.description} Temporarily available only to trusted local CLI callers; agent-facing code reads are suspended.`,
     handler: async (ctx, params) => {
@@ -311,6 +316,6 @@ export const codeIntelOperations: Operation[] = [
       }
       return op.handler(ctx, params);
     },
-  })),
+  }))),
   code_traversal_cache_clear,
 ];
