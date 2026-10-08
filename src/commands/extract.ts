@@ -1880,8 +1880,12 @@ async function extractLinksFromDB(
     const pack = packs.get(source_id);
     if (!pack) throw new Error('Cannot extract links: active schema pack is unavailable.');
     const batch: LinkBatchInput[] = [];
-    if (!resolvers.has(source_id)) resolvers.set(source_id, makeResolver(engine, { mode: 'batch', sourceId: source_id }));
-    const resolver = resolvers.get(source_id)!;
+    // Fork carry (ymyd patch ⑳): with `link_resolution.cross_source` on, the
+    // basename index must span every source — a per-source resolver can never
+    // produce a cross-source candidate for a bare `[[name]]` wikilink.
+    const resolverKey = crossSource ? '__all__' : source_id;
+    if (!resolvers.has(resolverKey)) resolvers.set(resolverKey, makeResolver(engine, { mode: 'batch', sourceId: crossSource ? undefined : source_id }));
+    const resolver = resolvers.get(resolverKey)!;
 
     const fullContent = page.compiled_truth + '\n' + page.timeline;
     // --include-frontmatter default OFF in v0.13 (codex tension 5, back-compat).
@@ -2141,8 +2145,10 @@ export async function extractStaleFromDB(
       if (!snapshot) throw new Error('Link extraction origin changed during the stale scan');
       const fullContent = snapshot.page.compiled_truth + '\n' + snapshot.page.timeline;
       const linkRows: LinkBatchInput[] = [];
-      if (!resolvers.has(page.source_id)) resolvers.set(page.source_id, makeResolver(engine, { mode: 'batch', sourceId: page.source_id }));
-      const resolver = resolvers.get(page.source_id)!;
+      // Fork carry (ymyd patch ⑳): see extractLinksFromDB — global basename index when cross_source is on.
+      const resolverKey = crossSource ? '__all__' : page.source_id;
+      if (!resolvers.has(resolverKey)) resolvers.set(resolverKey, makeResolver(engine, { mode: 'batch', sourceId: crossSource ? undefined : page.source_id }));
+      const resolver = resolvers.get(resolverKey)!;
       const extracted = await extractPageLinks(
         page.slug, fullContent, snapshot.page.frontmatter, snapshot.page.type, resolver,
         { skipFrontmatter: !includeFrontmatter, globalBasename, pack, targetType: (targetSlug, targetSourceId) => {
